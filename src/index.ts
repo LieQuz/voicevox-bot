@@ -66,6 +66,7 @@ type GuildState = {
   processing: boolean;
   speaker: number;
   textChannelId: string;
+  voiceChannelId: string;
   currentTempFile?: string;
 };
 
@@ -113,6 +114,34 @@ client.on("messageCreate", async (message) => {
   });
 
   await processQueue(message.guild.id);
+});
+
+client.on("voiceStateUpdate", async (oldState, newState) => {
+  const guildId = newState.guild.id;
+  const state = guildStates.get(guildId);
+  if (!state) {
+    return;
+  }
+
+  const changedVoiceState =
+    oldState.channelId === state.voiceChannelId || newState.channelId === state.voiceChannelId;
+  if (!changedVoiceState) {
+    return;
+  }
+
+  const voiceChannel = newState.guild.channels.cache.get(state.voiceChannelId);
+  if (!voiceChannel) {
+    return;
+  }
+
+  if (voiceChannel.type !== ChannelType.GuildVoice && voiceChannel.type !== ChannelType.GuildStageVoice) {
+    return;
+  }
+
+  const humanMemberCount = [...voiceChannel.members.values()].filter((member) => !member.user.bot).length;
+  if (humanMemberCount === 0) {
+    await disconnectGuild(guildId);
+  }
 });
 
 async function handleCommand(message: Message): Promise<void> {
@@ -201,23 +230,20 @@ async function joinCommand(message: Message): Promise<void> {
     queue: [],
     processing: false,
     speaker: defaultSpeaker,
-    textChannelId: message.channel.id
+    textChannelId: message.channel.id,
+    voiceChannelId: voiceChannel.id
   });
 
   await message.reply("VCへ参加しました。このチャンネルのメッセージを読み上げます。");
 }
 
 async function leaveCommand(message: Message): Promise<void> {
-  const state = guildStates.get(message.guild!.id);
-  if (!state) {
+  if (!guildStates.has(message.guild!.id)) {
     await message.reply("接続していません。");
     return;
   }
 
-  state.queue.length = 0;
-  state.connection.destroy();
-  guildStates.delete(message.guild!.id);
-  await cleanupTempFile(state.currentTempFile);
+  await disconnectGuild(message.guild!.id);
   await message.reply("VCから退出しました。");
 }
 
@@ -379,6 +405,18 @@ async function cleanupTempFile(filePath?: string): Promise<void> {
   } catch (error) {
     console.error(`Failed to remove temp file ${filePath}:`, error);
   }
+}
+
+async function disconnectGuild(guildId: string): Promise<void> {
+  const state = guildStates.get(guildId);
+  if (!state) {
+    return;
+  }
+
+  state.queue.length = 0;
+  state.connection.destroy();
+  guildStates.delete(guildId);
+  await cleanupTempFile(state.currentTempFile);
 }
 
 function normalizeForSpeech(content: string): string {
