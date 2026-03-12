@@ -26,6 +26,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const token = process.env.DISCORD_TOKEN;
+const commandGuildId = process.env.DISCORD_GUILD_ID;
 const voicevoxBaseUrl = process.env.VOICEVOX_BASE_URL ?? "http://127.0.0.1:50021";
 const defaultSpeaker = Number.parseInt(process.env.DEFAULT_SPEAKER ?? "1", 10);
 const defaultSpeedScale = Number.parseFloat(process.env.DEFAULT_SPEED_SCALE ?? "1.2");
@@ -107,7 +108,16 @@ client.once("ready", async () => {
   client.user?.setActivity("/help | /join | /speaker 3", {
     type: ActivityType.Listening
   });
+
+  if (commandGuildId) {
+    const guild = await client.guilds.fetch(commandGuildId);
+    await guild.commands.set(slashCommands);
+    console.log(`Registered slash commands for guild ${guild.id} (${guild.name})`);
+    return;
+  }
+
   await client.application?.commands.set(slashCommands);
+  console.log("Registered global slash commands");
 });
 
 client.on("messageCreate", async (message) => {
