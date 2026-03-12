@@ -12,6 +12,7 @@ import {
   joinVoiceChannel
 } from "@discordjs/voice";
 import {
+  ActivityType,
   ChannelType,
   Client,
   GatewayIntentBits,
@@ -84,6 +85,9 @@ const client = new Client({
 
 client.once("ready", () => {
   console.log(`Logged in as ${client.user?.tag}`);
+  client.user?.setActivity(`${prefix}help | ${prefix}join | ${prefix}speaker 3`, {
+    type: ActivityType.Listening
+  });
 });
 
 client.on("messageCreate", async (message) => {
@@ -177,7 +181,7 @@ async function handleCommand(message: Message): Promise<void> {
   if (command === "help") {
     let speakerLines: string[];
     try {
-      speakerLines = await fetchSpeakerListForHelp();
+      speakerLines = await fetchSpeakerSummaryLines(8);
     } catch (error) {
       console.error("Failed to fetch speaker list:", error);
       speakerLines = ["- 話者一覧の取得に失敗しました（VOICEVOX接続を確認してください）"];
@@ -188,14 +192,35 @@ async function handleCommand(message: Message): Promise<void> {
       `- \`${prefix}join\` : 自分がいるVCにBotを参加`,
       `- \`${prefix}leave\` : BotをVCから退出`,
       `- \`${prefix}speaker <number>\` : あなたの話者IDを保存`,
+      `- \`${prefix}speakers\` : 話者一覧を見やすく表示`,
       "",
-      "話者ID一覧:",
+      "操作の流れ:",
+      `1) \`${prefix}join\` でVC参加`,
+      `2) \`${prefix}speaker 3\` で自分の話者を設定`,
+      `3) テキストを送信すると読み上げ`,
+      "",
+      "話者ID一覧（先頭8件）:",
       ...speakerLines
     ].join("\n");
 
     await message.reply(
       helpText.length > 1800 ? `${helpText.slice(0, 1790)}\n...（省略）` : helpText
     );
+    return;
+  }
+
+  if (command === "speakers") {
+    let lines: string[];
+    try {
+      lines = await fetchSpeakerSummaryLines();
+    } catch (error) {
+      console.error("Failed to fetch speaker list:", error);
+      await message.reply("話者一覧の取得に失敗しました（VOICEVOX接続を確認してください）。");
+      return;
+    }
+
+    await replyInChunks(message, "話者ID一覧:", lines);
+    return;
   }
 }
 
@@ -325,18 +350,72 @@ async function synthesizeVoice(text: string, speaker: number): Promise<Buffer> {
   return Buffer.from(audioBuffer);
 }
 
-async function fetchSpeakerListForHelp(): Promise<string[]> {
+async function fetchVoicevoxSpeakers(): Promise<VoicevoxSpeaker[]> {
   const response = await fetch(`${voicevoxBaseUrl}/speakers`);
   if (!response.ok) {
     throw new Error(`VOICEVOX speakers failed: ${response.status} ${response.statusText}`);
   }
 
-  const speakers = (await response.json()) as VoicevoxSpeaker[];
-  const lines = speakers.flatMap((speaker) =>
-    speaker.styles.map((style) => `- ${style.id}: ${speaker.name}（${style.name}）`)
-  );
+  return (await response.json()) as VoicevoxSpeaker[];
+}
 
-  return lines.length > 0 ? lines : ["- 話者一覧が空です"];
+async function fetchSpeakerSummaryLines(limit?: number): Promise<string[]> {
+  const speakers = await fetchVoicevoxSpeakers();
+  const lines = speakers.map((speaker) => {
+    const styles = speaker.styles.map((style) => `${style.id}:${style.name}`).join(", ");
+    return `- ${speaker.name}: ${styles}`;
+  });
+
+  if (lines.length === 0) {
+    return ["- 話者一覧が空です"];
+  }
+
+  if (!limit) {
+    return lines;
+  }
+
+  return lines.slice(0, limit);
+}
+
+async function replyInChunks(message: Message, title: string, lines: string[]): Promise<void> {
+  const splitLine = (line: string, limit: number): string[] => {
+    if (line.length <= limit) {
+      return [line];
+    }
+
+    const parts: string[] = [];
+    let start = 0;
+    while (start < line.length) {
+      parts.push(line.slice(start, start + limit));
+      start += limit;
+    }
+    return parts;
+  };
+
+  let chunk = `${title}\n`;
+  for (const line of lines) {
+    const parts = splitLine(line, 1700);
+    for (const part of parts) {
+      const candidate = `${chunk}${part}\n`;
+      if (candidate.length > 1800) {
+        await message.reply(chunk.trimEnd());
+        chunk = `${part}\n`;
+        continue;
+      }
+
+      chunk = candidate;
+    }
+  }
+
+  if (chunk.trim().length > 0) {
+    await message.reply(chunk.trimEnd());
+  }
+
+  const totalStyles = lines.reduce(
+    (count, line) => count + (line.match(/\d+:/g)?.length ?? 0),
+    0
+  );
+  await message.reply(`合計 ${lines.length} キャラクター / ${totalStyles} スタイル`);
 }
 
 async function initDatabase(): Promise<void> {
