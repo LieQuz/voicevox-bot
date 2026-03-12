@@ -1,4 +1,6 @@
 import "dotenv/config";
+import { open, type Database } from "sqlite";
+import sqlite3 from "sqlite3";
 import {
   AudioPlayer,
   AudioPlayerStatus,
@@ -54,6 +56,7 @@ type VoicevoxSpeaker = {
 
 type QueueItem = {
   text: string;
+  speaker: number;
 };
 
 type GuildState = {
@@ -67,6 +70,7 @@ type GuildState = {
 };
 
 const guildStates = new Map<string, GuildState>();
+let db: Database;
 
 const client = new Client({
   intents: [
@@ -101,8 +105,11 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
+  const speaker = (await getUserSpeaker(message.guild.id, message.author.id)) ?? state.speaker;
+
   state.queue.push({
-    text
+    text,
+    speaker
   });
 
   await processQueue(message.guild.id);
@@ -133,14 +140,8 @@ async function handleCommand(message: Message): Promise<void> {
       return;
     }
 
-    const state = guildStates.get(message.guild!.id);
-    if (!state) {
-      await message.reply("先に `!join` してください。");
-      return;
-    }
-
-    state.speaker = speaker;
-    await message.reply(`話者IDを ${speaker} に変更しました。`);
+    await setUserSpeaker(message.guild!.id, message.author.id, speaker);
+    await message.reply(`あなたの話者IDを ${speaker} に保存しました。`);
     return;
   }
 
@@ -157,7 +158,7 @@ async function handleCommand(message: Message): Promise<void> {
       "コマンド一覧:",
       `- \`${prefix}join\` : 自分がいるVCにBotを参加`,
       `- \`${prefix}leave\` : BotをVCから退出`,
-      `- \`${prefix}speaker <number>\` : VOICEVOXの話者IDを変更`,
+      `- \`${prefix}speaker <number>\` : あなたの話者IDを保存`,
       "",
       "話者ID一覧:",
       ...speakerLines
@@ -234,7 +235,7 @@ async function processQueue(guildId: string): Promise<void> {
   state.processing = true;
 
   try {
-    const wav = await synthesizeVoice(next.text, state.speaker);
+    const wav = await synthesizeVoice(next.text, next.speaker);
     const filePath = await saveTempWav(wav);
     state.currentTempFile = filePath;
 
@@ -312,6 +313,53 @@ async function fetchSpeakerListForHelp(): Promise<string[]> {
   return lines.length > 0 ? lines : ["- 話者一覧が空です"];
 }
 
+async function initDatabase(): Promise<void> {
+  const dataDir = join(process.cwd(), "data");
+  await mkdir(dataDir, { recursive: true });
+
+  db = await open({
+    filename: join(dataDir, "voicevox-bot.sqlite3"),
+    driver: sqlite3.Database
+  });
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS user_speakers (
+      guild_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      speaker INTEGER NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (guild_id, user_id)
+    );
+  `);
+}
+
+async function setUserSpeaker(guildId: string, userId: string, speaker: number): Promise<void> {
+  await db.run(
+    `
+      INSERT INTO user_speakers (guild_id, user_id, speaker)
+      VALUES (?, ?, ?)
+      ON CONFLICT(guild_id, user_id)
+      DO UPDATE SET speaker = excluded.speaker, updated_at = CURRENT_TIMESTAMP;
+    `,
+    guildId,
+    userId,
+    speaker
+  );
+}
+
+async function getUserSpeaker(guildId: string, userId: string): Promise<number | undefined> {
+  const row = await db.get<{ speaker: number }>(
+    `
+      SELECT speaker
+      FROM user_speakers
+      WHERE guild_id = ? AND user_id = ?;
+    `,
+    guildId,
+    userId
+  );
+  return row?.speaker;
+}
+
 async function saveTempWav(audio: Buffer): Promise<string> {
   const tempDir = join(tmpdir(), "voicevox-bot");
   await mkdir(tempDir, { recursive: true });
@@ -347,7 +395,12 @@ function isJoinableVoiceChannel(channel: VoiceBasedChannel): boolean {
   return channel.type === ChannelType.GuildVoice || channel.type === ChannelType.GuildStageVoice;
 }
 
-client.login(token).catch((error) => {
-  console.error("Failed to login Discord client:", error);
+async function main(): Promise<void> {
+  await initDatabase();
+  await client.login(token);
+}
+
+main().catch((error) => {
+  console.error("Failed to start Discord client:", error);
   process.exit(1);
 });

@@ -7,9 +7,10 @@
 
 - `!join`: 実行者がいるボイスチャンネルへ参加
 - `!leave`: ボイスチャンネルから退出
-- `!speaker <id>`: 話者IDを変更
+- `!speaker <id>`: 自分の話者IDを変更（永続化）
 - `!help`: コマンド一覧 + 話者ID一覧を表示
 - `!join` を実行したテキストチャンネルの通常メッセージを読み上げ
+- ユーザーごとの話者IDを SQLite に永続保存（Bot再起動後も維持）
 
 ## 事前準備（Discord側）
 
@@ -71,6 +72,9 @@ VOICEVOX_BASE_URL=http://127.0.0.1:50021
 DEFAULT_SPEAKER=1
 DEFAULT_SPEED_SCALE=1.2
 ```
+
+`!speaker <id>` は「実行したユーザー自身」の設定を保存します。  
+保存先DB: `data/voicevox-bot.sqlite3`
 
 ## VOICEVOX Engine 起動（Docker）
 
