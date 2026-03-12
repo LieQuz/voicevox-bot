@@ -1,0 +1,148 @@
+# voicevox-bot
+
+`discord.js` + VOICEVOX Engine で動く Discord 読み上げ Bot です。  
+自宅サーバー（Ubuntu）へデプロイしやすい手順を中心に書いています。
+
+## できること
+
+- `!join`: 実行者がいるボイスチャンネルへ参加
+- `!leave`: ボイスチャンネルから退出
+- `!speaker <id>`: 話者IDを変更
+- `!help`: コマンド一覧 + 話者ID一覧を表示
+- `!join` を実行したテキストチャンネルの通常メッセージを読み上げ
+
+## 事前準備（Discord側）
+
+1. Discord Developer Portal で Bot を作成
+2. Bot の Token を発行
+3. **Privileged Gateway Intents** で以下を有効化
+   - `MESSAGE CONTENT INTENT`
+   - `SERVER MEMBERS INTENT`（推奨）
+4. Bot をサーバーに招待
+
+## Ubuntuサーバーへ導入
+
+### 1) 必要パッケージ
+
+```bash
+sudo apt update
+sudo apt install -y curl git ffmpeg ca-certificates
+```
+
+### 2) Node.js 20+ を入れる（NodeSource）
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+node -v
+npm -v
+```
+
+### 3) Docker を入れる（VOICEVOX Engine 用）
+
+```bash
+sudo apt install -y docker.io
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+```
+
+> `usermod` 後は一度ログアウト/ログインしてください。
+
+### 4) プロジェクト配置
+
+```bash
+git clone <YOUR_REPO_URL> voicevox-bot
+cd voicevox-bot
+npm install
+```
+
+### 5) 環境変数設定
+
+```bash
+cp .env.example .env
+```
+
+`.env` を編集:
+
+```dotenv
+DISCORD_TOKEN=あなたのBotトークン
+PREFIX=!
+VOICEVOX_BASE_URL=http://127.0.0.1:50021
+DEFAULT_SPEAKER=1
+DEFAULT_SPEED_SCALE=1.2
+```
+
+## VOICEVOX Engine 起動（Docker）
+
+```bash
+docker pull voicevox/voicevox_engine:cpu-latest
+docker run -d --name voicevox-engine -p 50021:50021 voicevox/voicevox_engine:cpu-latest
+```
+
+疎通確認:
+
+```bash
+curl http://127.0.0.1:50021/version
+```
+
+## Bot起動
+
+```bash
+npm run build
+npm run start
+```
+
+## systemd で常駐化（推奨）
+
+`/etc/systemd/system/voicevox-bot.service` を作成:
+
+```ini
+[Unit]
+Description=VOICEVOX Discord Bot
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/voicevox-bot
+ExecStart=/usr/bin/npm run start
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+```
+
+反映:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now voicevox-bot
+sudo systemctl status voicevox-bot
+```
+
+ログ確認:
+
+```bash
+journalctl -u voicevox-bot -f
+```
+
+## 運用コマンド
+
+- Bot再起動: `sudo systemctl restart voicevox-bot`
+- Bot停止: `sudo systemctl stop voicevox-bot`
+- VOICEVOX再起動: `docker restart voicevox-engine`
+- VOICEVOXログ: `docker logs -f voicevox-engine`
+
+## よくあるトラブル
+
+- 読み上げされない  
+  VOICEVOXのポート公開を確認: `docker ps` で `0.0.0.0:50021->50021/tcp`
+
+- `TokenInvalid`  
+  `.env` の `DISCORD_TOKEN` を再確認
+
+- `!help` で話者一覧が出ない  
+  `VOICEVOX_BASE_URL` と Engine 稼働状態を確認
