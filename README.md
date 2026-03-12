@@ -5,15 +5,16 @@
 
 ## できること
 
-- `!join`: 実行者がいるボイスチャンネルへ参加
-- `!leave`: ボイスチャンネルから退出
-- `!speaker <id>`: 自分の話者IDを変更（永続化）
-- `!speakers`: 話者一覧を見やすく表示
-- `!help`: コマンド一覧 + 主要話者一覧（先頭8件）を表示
-- `!join` を実行したテキストチャンネルの通常メッセージを読み上げ
+- `/join`: 実行者がいるボイスチャンネルへ参加
+- `/leave`: ボイスチャンネルから退出
+- `/speaker id:<id>`: 自分の話者IDを変更（永続化）
+- `/speakers`: 話者一覧を見やすく表示
+- `/help`: コマンド一覧 + 主要話者一覧（先頭8件）を表示
+- `/join` を実行したテキストチャンネルの通常メッセージを読み上げ
 - ユーザーごとの話者IDを SQLite に永続保存（Bot再起動後も維持）
 - VCの人間メンバーが0人になると自動で退出
-- BotのDiscordステータスに `!help / !join / !speaker 3` の操作ヒントを表示
+- BotのDiscordステータスに `/help / /join / /speaker 3` の操作ヒントを表示
+- コマンド応答は全て ephemeral（実行者のみ表示）
 
 ## 事前準備（Discord側）
 
@@ -70,7 +71,6 @@ cp .env.example .env
 
 ```dotenv
 DISCORD_TOKEN=あなたのBotトークン
-PREFIX=!
 VOICEVOX_BASE_URL=http://127.0.0.1:50021
 DEFAULT_SPEAKER=1
 DEFAULT_SPEED_SCALE=1.2
@@ -152,5 +152,5 @@ journalctl -u voicevox-bot -f
 - `TokenInvalid`  
   `.env` の `DISCORD_TOKEN` を再確認
 
-- `!help` で話者一覧が出ない  
+- `/help` で話者一覧が出ない  
   `VOICEVOX_BASE_URL` と Engine 稼働状態を確認

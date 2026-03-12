@@ -13,10 +13,11 @@ import {
 } from "@discordjs/voice";
 import {
   ActivityType,
+  ChatInputCommandInteraction,
   ChannelType,
   Client,
   GatewayIntentBits,
-  Message,
+  SlashCommandBuilder,
   VoiceBasedChannel
 } from "discord.js";
 import { randomUUID } from "node:crypto";
@@ -25,7 +26,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const token = process.env.DISCORD_TOKEN;
-const prefix = process.env.PREFIX ?? "!";
 const voicevoxBaseUrl = process.env.VOICEVOX_BASE_URL ?? "http://127.0.0.1:50021";
 const defaultSpeaker = Number.parseInt(process.env.DEFAULT_SPEAKER ?? "1", 10);
 const defaultSpeedScale = Number.parseFloat(process.env.DEFAULT_SPEED_SCALE ?? "1.2");
@@ -91,20 +91,27 @@ const client = new Client({
   ]
 });
 
-client.once("ready", () => {
+const slashCommands = [
+  new SlashCommandBuilder().setName("join").setDescription("自分がいるVCにBotを参加させます"),
+  new SlashCommandBuilder().setName("leave").setDescription("BotをVCから退出させます"),
+  new SlashCommandBuilder()
+    .setName("speaker")
+    .setDescription("あなたの話者IDを保存します")
+    .addIntegerOption((option) => option.setName("id").setDescription("話者ID").setRequired(true)),
+  new SlashCommandBuilder().setName("help").setDescription("使い方と主要話者一覧を表示します"),
+  new SlashCommandBuilder().setName("speakers").setDescription("話者一覧を表示します")
+].map((command) => command.toJSON());
+
+client.once("ready", async () => {
   console.log(`Logged in as ${client.user?.tag}`);
-  client.user?.setActivity(`${prefix}help | ${prefix}join | ${prefix}speaker 3`, {
+  client.user?.setActivity("/help | /join | /speaker 3", {
     type: ActivityType.Listening
   });
+  await client.application?.commands.set(slashCommands);
 });
 
 client.on("messageCreate", async (message) => {
   if (!message.guild || message.author.bot) {
-    return;
-  }
-
-  if (message.content.startsWith(prefix)) {
-    await handleCommand(message);
     return;
   }
 
@@ -128,6 +135,76 @@ client.on("messageCreate", async (message) => {
   await processQueue(message.guild.id);
 });
 
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand() || !interaction.guild) {
+    return;
+  }
+
+  if (interaction.commandName === "join") {
+    await joinCommand(interaction);
+    return;
+  }
+
+  if (interaction.commandName === "leave") {
+    await leaveCommand(interaction);
+    return;
+  }
+
+  if (interaction.commandName === "speaker") {
+    const speaker = interaction.options.getInteger("id", true);
+    if (speaker <= 0) {
+      await replyPrivate(interaction, "`/speaker id:<number>` で話者IDを指定してください。");
+      return;
+    }
+
+    await setUserSpeaker(interaction.guild.id, interaction.user.id, speaker);
+    await replyPrivate(interaction, `あなたの話者IDを ${speaker} に保存しました。`);
+    return;
+  }
+
+  if (interaction.commandName === "help") {
+    let speakerLines: string[];
+    try {
+      speakerLines = await fetchSpeakerSummaryLines(8);
+    } catch (error) {
+      console.error("Failed to fetch speaker list:", error);
+      speakerLines = ["- 話者一覧の取得に失敗しました（VOICEVOX接続を確認してください）"];
+    }
+
+    const helpText = [
+      "コマンド一覧:",
+      "- `/join` : 自分がいるVCにBotを参加",
+      "- `/leave` : BotをVCから退出",
+      "- `/speaker id:<number>` : あなたの話者IDを保存",
+      "- `/speakers` : 話者一覧を見やすく表示",
+      "",
+      "操作の流れ:",
+      "1) `/join` でVC参加",
+      "2) `/speaker id:3` で自分の話者を設定",
+      "3) テキストを送信すると読み上げ",
+      "",
+      "話者ID一覧（先頭8件）:",
+      ...speakerLines
+    ].join("\n");
+
+    await replyPrivate(interaction, helpText.length > 1800 ? `${helpText.slice(0, 1790)}\n...（省略）` : helpText);
+    return;
+  }
+
+  if (interaction.commandName === "speakers") {
+    let lines: string[];
+    try {
+      lines = await fetchSpeakerSummaryLines();
+    } catch (error) {
+      console.error("Failed to fetch speaker list:", error);
+      await replyPrivate(interaction, "話者一覧の取得に失敗しました（VOICEVOX接続を確認してください）。");
+      return;
+    }
+
+    await replyInChunks(interaction, "話者ID一覧:", lines);
+  }
+});
+
 client.on("voiceStateUpdate", async (oldState, newState) => {
   const guildId = newState.guild.id;
   const state = guildStates.get(guildId);
@@ -139,7 +216,7 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
   const botWasInManagedChannel = oldState.id === botUserId && oldState.channelId === state.voiceChannelId;
   const botLeftManagedChannel = newState.channelId !== state.voiceChannelId;
   if (botWasInManagedChannel && botLeftManagedChannel) {
-    await disconnectGuildInternal(guildId, false);
+    await disconnectGuildInternal(guildId, true);
     await notifyTextChannel(state.textChannelId, "⚠️ 右クリック等で強制切断されたため、読み上げを停止しました。");
     return;
   }
@@ -165,93 +242,33 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
   }
 });
 
-async function handleCommand(message: Message): Promise<void> {
-  const [rawCommand, ...rest] = message.content.slice(prefix.length).trim().split(/\s+/);
-  const command = rawCommand?.toLowerCase();
-
-  if (!command) {
-    return;
-  }
-
-  if (command === "join") {
-    await joinCommand(message);
-    return;
-  }
-
-  if (command === "leave") {
-    await leaveCommand(message);
-    return;
-  }
-
-  if (command === "speaker") {
-    const speaker = Number.parseInt(rest[0] ?? "", 10);
-    if (Number.isNaN(speaker) || speaker <= 0) {
-      await message.reply("`!speaker <number>` で話者IDを指定してください。");
-      return;
-    }
-
-    await setUserSpeaker(message.guild!.id, message.author.id, speaker);
-    await message.reply(`あなたの話者IDを ${speaker} に保存しました。`);
-    return;
-  }
-
-  if (command === "help") {
-    let speakerLines: string[];
-    try {
-      speakerLines = await fetchSpeakerSummaryLines(8);
-    } catch (error) {
-      console.error("Failed to fetch speaker list:", error);
-      speakerLines = ["- 話者一覧の取得に失敗しました（VOICEVOX接続を確認してください）"];
-    }
-
-    const helpText = [
-      "コマンド一覧:",
-      `- \`${prefix}join\` : 自分がいるVCにBotを参加`,
-      `- \`${prefix}leave\` : BotをVCから退出`,
-      `- \`${prefix}speaker <number>\` : あなたの話者IDを保存`,
-      `- \`${prefix}speakers\` : 話者一覧を見やすく表示`,
-      "",
-      "操作の流れ:",
-      `1) \`${prefix}join\` でVC参加`,
-      `2) \`${prefix}speaker 3\` で自分の話者を設定`,
-      `3) テキストを送信すると読み上げ`,
-      "",
-      "話者ID一覧（先頭8件）:",
-      ...speakerLines
-    ].join("\n");
-
-    await message.reply(
-      helpText.length > 1800 ? `${helpText.slice(0, 1790)}\n...（省略）` : helpText
-    );
-    return;
-  }
-
-  if (command === "speakers") {
-    let lines: string[];
-    try {
-      lines = await fetchSpeakerSummaryLines();
-    } catch (error) {
-      console.error("Failed to fetch speaker list:", error);
-      await message.reply("話者一覧の取得に失敗しました（VOICEVOX接続を確認してください）。");
-      return;
-    }
-
-    await replyInChunks(message, "話者ID一覧:", lines);
-    return;
-  }
-}
-
-async function joinCommand(message: Message): Promise<void> {
-  const voiceChannel = message.member?.voice.channel;
+async function joinCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  const member = await interaction.guild!.members.fetch(interaction.user.id);
+  const voiceChannel = member.voice.channel;
   if (!voiceChannel || !isJoinableVoiceChannel(voiceChannel)) {
-    await message.reply("先にあなたがボイスチャンネルへ参加してください。");
+    await replyPrivate(interaction, "先にあなたがボイスチャンネルへ参加してください。");
     return;
   }
 
-  const existing = guildStates.get(message.guild!.id);
+  const existing = guildStates.get(interaction.guild!.id);
   if (existing) {
-    existing.textChannelId = message.channel.id;
-    await message.reply("すでに接続中です。読み上げ対象テキストチャンネルを更新しました。");
+    const existingStatus = existing.connection.state.status;
+    if (
+      existingStatus === VoiceConnectionStatus.Destroyed ||
+      existingStatus === VoiceConnectionStatus.Disconnected
+    ) {
+      await disconnectGuildInternal(interaction.guild!.id, false);
+    } else {
+      existing.textChannelId = interaction.channelId;
+      await replyPrivate(interaction, "すでに接続中です。読み上げ対象テキストチャンネルを更新しました。");
+      return;
+    }
+  }
+
+  const refreshedState = guildStates.get(interaction.guild!.id);
+  if (refreshedState) {
+    refreshedState.textChannelId = interaction.channelId;
+    await replyPrivate(interaction, "すでに接続中です。読み上げ対象テキストチャンネルを更新しました。");
     return;
   }
 
@@ -266,27 +283,27 @@ async function joinCommand(message: Message): Promise<void> {
   const player = createAudioPlayer();
   connection.subscribe(player);
 
-  guildStates.set(message.guild!.id, {
+  guildStates.set(interaction.guild!.id, {
     connection,
     player,
     queue: [],
     processing: false,
     speaker: defaultSpeaker,
-    textChannelId: message.channel.id,
+    textChannelId: interaction.channelId,
     voiceChannelId: voiceChannel.id
   });
 
-  await message.reply("VCへ参加しました。このチャンネルのメッセージを読み上げます。");
+  await replyPrivate(interaction, "VCへ参加しました。このチャンネルのメッセージを読み上げます。");
 }
 
-async function leaveCommand(message: Message): Promise<void> {
-  if (!guildStates.has(message.guild!.id)) {
-    await message.reply("接続していません。");
+async function leaveCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  if (!guildStates.has(interaction.guild!.id)) {
+    await replyPrivate(interaction, "接続していません。");
     return;
   }
 
-  await disconnectGuild(message.guild!.id);
-  await message.reply("VCから退出しました。");
+  await disconnectGuild(interaction.guild!.id);
+  await replyPrivate(interaction, "VCから退出しました。");
 }
 
 async function processQueue(guildId: string): Promise<void> {
@@ -413,7 +430,11 @@ async function fetchSpeakerSummaryLines(limit?: number): Promise<string[]> {
   return lines.slice(0, limit);
 }
 
-async function replyInChunks(message: Message, title: string, lines: string[]): Promise<void> {
+async function replyInChunks(
+  interaction: ChatInputCommandInteraction,
+  title: string,
+  lines: string[]
+): Promise<void> {
   const splitLine = (line: string, limit: number): string[] => {
     if (line.length <= limit) {
       return [line];
@@ -434,7 +455,7 @@ async function replyInChunks(message: Message, title: string, lines: string[]): 
     for (const part of parts) {
       const candidate = `${chunk}${part}\n`;
       if (candidate.length > 1800) {
-        await message.reply(chunk.trimEnd());
+        await replyPrivate(interaction, chunk.trimEnd());
         chunk = `${part}\n`;
         continue;
       }
@@ -444,14 +465,14 @@ async function replyInChunks(message: Message, title: string, lines: string[]): 
   }
 
   if (chunk.trim().length > 0) {
-    await message.reply(chunk.trimEnd());
+    await replyPrivate(interaction, chunk.trimEnd());
   }
 
   const totalStyles = lines.reduce(
     (count, line) => count + (line.match(/\d+:/g)?.length ?? 0),
     0
   );
-  await message.reply(`合計 ${lines.length} キャラクター / ${totalStyles} スタイル`);
+  await replyPrivate(interaction, `合計 ${lines.length} キャラクター / ${totalStyles} スタイル`);
 }
 
 async function initDatabase(): Promise<void> {
@@ -533,11 +554,20 @@ async function disconnectGuildInternal(guildId: string, destroyConnection: boole
   }
 
   state.queue.length = 0;
-  if (destroyConnection) {
+  if (destroyConnection && state.connection.state.status !== VoiceConnectionStatus.Destroyed) {
     state.connection.destroy();
   }
   guildStates.delete(guildId);
   await cleanupTempFile(state.currentTempFile);
+}
+
+async function replyPrivate(interaction: ChatInputCommandInteraction, content: string): Promise<void> {
+  if (interaction.deferred || interaction.replied) {
+    await interaction.followUp({ content, ephemeral: true });
+    return;
+  }
+
+  await interaction.reply({ content, ephemeral: true });
 }
 
 async function notifyTextChannel(textChannelId: string, content: string): Promise<void> {
