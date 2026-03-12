@@ -29,6 +29,7 @@ const prefix = process.env.PREFIX ?? "!";
 const voicevoxBaseUrl = process.env.VOICEVOX_BASE_URL ?? "http://127.0.0.1:50021";
 const defaultSpeaker = Number.parseInt(process.env.DEFAULT_SPEAKER ?? "1", 10);
 const defaultSpeedScale = Number.parseFloat(process.env.DEFAULT_SPEED_SCALE ?? "1.2");
+const speakerCacheTtlMs = Number.parseInt(process.env.SPEAKER_CACHE_TTL_MS ?? "300000", 10);
 
 if (!token) {
   throw new Error("DISCORD_TOKEN is not set.");
@@ -40,6 +41,10 @@ if (Number.isNaN(defaultSpeaker)) {
 
 if (Number.isNaN(defaultSpeedScale) || defaultSpeedScale <= 0) {
   throw new Error("DEFAULT_SPEED_SCALE must be a positive number.");
+}
+
+if (Number.isNaN(speakerCacheTtlMs) || speakerCacheTtlMs < 0) {
+  throw new Error("SPEAKER_CACHE_TTL_MS must be zero or a positive number.");
 }
 
 type VoicevoxAudioQuery = {
@@ -73,6 +78,9 @@ type GuildState = {
 
 const guildStates = new Map<string, GuildState>();
 let db: Database;
+let cachedSpeakers: VoicevoxSpeaker[] | null = null;
+let speakersCachedAt = 0;
+let speakerFetchInFlight: Promise<VoicevoxSpeaker[]> | null = null;
 
 const client = new Client({
   intents: [
@@ -124,6 +132,15 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
   const guildId = newState.guild.id;
   const state = guildStates.get(guildId);
   if (!state) {
+    return;
+  }
+
+  const botUserId = client.user?.id;
+  const botWasInManagedChannel = oldState.id === botUserId && oldState.channelId === state.voiceChannelId;
+  const botLeftManagedChannel = newState.channelId !== state.voiceChannelId;
+  if (botWasInManagedChannel && botLeftManagedChannel) {
+    await disconnectGuildInternal(guildId, false);
+    await notifyTextChannel(state.textChannelId, "⚠️ 右クリック等で強制切断されたため、読み上げを停止しました。");
     return;
   }
 
@@ -351,12 +368,31 @@ async function synthesizeVoice(text: string, speaker: number): Promise<Buffer> {
 }
 
 async function fetchVoicevoxSpeakers(): Promise<VoicevoxSpeaker[]> {
-  const response = await fetch(`${voicevoxBaseUrl}/speakers`);
-  if (!response.ok) {
-    throw new Error(`VOICEVOX speakers failed: ${response.status} ${response.statusText}`);
+  const now = Date.now();
+  const isCacheValid = cachedSpeakers !== null && now - speakersCachedAt < speakerCacheTtlMs;
+  if (isCacheValid && cachedSpeakers) {
+    return cachedSpeakers;
   }
 
-  return (await response.json()) as VoicevoxSpeaker[];
+  if (!speakerFetchInFlight) {
+    speakerFetchInFlight = (async () => {
+      const response = await fetch(`${voicevoxBaseUrl}/speakers`);
+      if (!response.ok) {
+        throw new Error(`VOICEVOX speakers failed: ${response.status} ${response.statusText}`);
+      }
+
+      const speakers = (await response.json()) as VoicevoxSpeaker[];
+      cachedSpeakers = speakers;
+      speakersCachedAt = Date.now();
+      return speakers;
+    })();
+  }
+
+  try {
+    return await speakerFetchInFlight;
+  } finally {
+    speakerFetchInFlight = null;
+  }
 }
 
 async function fetchSpeakerSummaryLines(limit?: number): Promise<string[]> {
@@ -487,15 +523,28 @@ async function cleanupTempFile(filePath?: string): Promise<void> {
 }
 
 async function disconnectGuild(guildId: string): Promise<void> {
+  await disconnectGuildInternal(guildId, true);
+}
+
+async function disconnectGuildInternal(guildId: string, destroyConnection: boolean): Promise<void> {
   const state = guildStates.get(guildId);
   if (!state) {
     return;
   }
 
   state.queue.length = 0;
-  state.connection.destroy();
+  if (destroyConnection) {
+    state.connection.destroy();
+  }
   guildStates.delete(guildId);
   await cleanupTempFile(state.currentTempFile);
+}
+
+async function notifyTextChannel(textChannelId: string, content: string): Promise<void> {
+  const channel = await client.channels.fetch(textChannelId);
+  if (channel?.isTextBased() && "send" in channel) {
+    await channel.send(content);
+  }
 }
 
 function normalizeForSpeech(content: string): string {

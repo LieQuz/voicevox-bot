@@ -74,6 +74,7 @@ PREFIX=!
 VOICEVOX_BASE_URL=http://127.0.0.1:50021
 DEFAULT_SPEAKER=1
 DEFAULT_SPEED_SCALE=1.2
+SPEAKER_CACHE_TTL_MS=300000
 ```
 
 `!speaker <id>` は「実行したユーザー自身」の設定を保存します。  
