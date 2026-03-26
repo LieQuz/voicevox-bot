@@ -20,7 +20,7 @@ import {
   SlashCommandBuilder,
   VoiceBasedChannel
 } from "discord.js";
-import emoji from "node-emoji";
+import nodeEmoji = require("node-emoji");
 import { randomUUID } from "node:crypto";
 import { mkdir, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -602,7 +602,7 @@ function normalizeForSpeech(content: string): string {
 
   const withoutUrls = trimmed.replace(/https?:\/\/\S+/g, "URL");
   const customEmojiNamed = withoutUrls.replace(/<a?:([a-zA-Z0-9_]+):\d+>/g, " $1 ");
-  const unicodeEmojiNamed = emoji.unemojify(customEmojiNamed);
+  const unicodeEmojiNamed = nodeEmoji.unemojify(customEmojiNamed);
   const shortcodeNamed = unicodeEmojiNamed.replace(/:([a-zA-Z0-9_+-]+):/g, " $1 ");
   const laughNormalized = shortcodeNamed
     .replace(/[wｗ]{2,}/g, " わら ")
