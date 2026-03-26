@@ -605,7 +605,7 @@ function normalizeForSpeech(content: string): string {
   const unicodeEmojiNamed = nodeEmoji.unemojify(customEmojiNamed);
   const shortcodeNamed = unicodeEmojiNamed.replace(/:([a-zA-Z0-9_+-]+):/g, " $1 ");
   const laughNormalized = shortcodeNamed
-    .replace(/[wｗ]{2,}/g, " わら ")
+    .replace(/[wｗ]{2,}/g, (match) => ` ${"わら".repeat(match.length)} `)
     .replace(/(?<=[ぁ-んァ-ヶ一-龯ー])[wｗ](?=$|[\s!！?？。、「」、,.])/g, "わら")
     .replace(/(^|[\s!！?？。、「」、,.()（）])([wｗ])(?=$|[\s!！?？。、「」、,.()（）])/g, "$1わら");
   const normalizedSpaces = laughNormalized.replace(/\s+/g, " ").trim();
