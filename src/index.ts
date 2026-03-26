@@ -67,6 +67,58 @@ type QueueItem = {
   speaker: number;
 };
 
+const emojiJapaneseReadings: Record<string, string> = {
+  grin: "にこにこ",
+  grinning: "にこにこ",
+  smile: "スマイル",
+  smiley: "えがお",
+  laughing: "だいしょう",
+  sweat_smile: "にがわらい",
+  joy: "うれしなみだ",
+  rofl: "だいばくしょう",
+  blush: "てれがお",
+  wink: "ウインク",
+  heart_eyes: "ハートのめ",
+  thinking_face: "かんがえちゅう",
+  sob: "おおなき",
+  cry: "なき",
+  angry: "おこり",
+  rage: "げきど",
+  scream: "ひめい",
+  thumbs_up: "いいね",
+  thumbs_down: "よくないね",
+  clap: "はくしゅ",
+  pray: "おねがい",
+  ok_hand: "オーケー",
+  muscle: "ちからこぶ",
+  fire: "ほのお",
+  sparkle: "きらきら",
+  sparkles: "きらきら",
+  star: "ほし",
+  boom: "どかん",
+  poop: "うんち",
+  skull: "どくろ",
+  ghost: "おばけ",
+  clown_face: "ピエロ",
+  broken_heart: "われたハート",
+  heart: "ハート",
+  red_heart: "あかいハート",
+  blue_heart: "あおいハート",
+  green_heart: "みどりのハート",
+  yellow_heart: "きいろいハート",
+  purple_heart: "むらさきのハート",
+  white_heart: "しろいハート",
+  black_heart: "くろいハート",
+  eyes: "め",
+  wave: "てをふる",
+  raised_hands: "ばんざい",
+  tada: "おいわい",
+  confetti_ball: "クラッカー",
+  party_popper: "パーティー",
+  100: "ひゃく",
+  zzz: "すやすや"
+};
+
 type GuildState = {
   connection: VoiceConnection;
   player: AudioPlayer;
@@ -603,7 +655,9 @@ function normalizeForSpeech(content: string): string {
   const withoutUrls = trimmed.replace(/https?:\/\/\S+/g, "URL");
   const customEmojiNamed = withoutUrls.replace(/<a?:([a-zA-Z0-9_]+):\d+>/g, " $1 ");
   const unicodeEmojiNamed = nodeEmoji.unemojify(customEmojiNamed);
-  const shortcodeNamed = unicodeEmojiNamed.replace(/:([a-zA-Z0-9_+-]+):/g, " $1 ");
+  const shortcodeNamed = unicodeEmojiNamed.replace(/:([a-zA-Z0-9_+-]+):/g, (_, shortcode: string) => {
+    return ` ${emojiJapaneseReadings[shortcode] ?? shortcode} `;
+  });
   const laughNormalized = shortcodeNamed
     .replace(/[wｗ]{2,}/g, (match) => ` ${"わら".repeat(match.length)} `)
     .replace(/(?<=[ぁ-んァ-ヶ一-龯ー])[wｗ](?=$|[\s!！?？。、「」、,.])/g, "わら")
