@@ -131,6 +131,7 @@ client.on("messageCreate", async (message) => {
   }
 
   if (message.content.trim().toLowerCase() === "s") {
+    state.queue.length = 0;
     state.player.stop(true);
     return;
   }
