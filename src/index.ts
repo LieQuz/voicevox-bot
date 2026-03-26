@@ -20,6 +20,7 @@ import {
   SlashCommandBuilder,
   VoiceBasedChannel
 } from "discord.js";
+import emoji from "node-emoji";
 import { randomUUID } from "node:crypto";
 import { mkdir, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -600,8 +601,14 @@ function normalizeForSpeech(content: string): string {
   }
 
   const withoutUrls = trimmed.replace(/https?:\/\/\S+/g, "URL");
-  const withoutCustomEmojis = withoutUrls.replace(/<a?:\w+:\d+>/g, " ");
-  const normalizedSpaces = withoutCustomEmojis.replace(/\s+/g, " ").trim();
+  const customEmojiNamed = withoutUrls.replace(/<a?:([a-zA-Z0-9_]+):\d+>/g, " $1 ");
+  const unicodeEmojiNamed = emoji.unemojify(customEmojiNamed);
+  const shortcodeNamed = unicodeEmojiNamed.replace(/:([a-zA-Z0-9_+-]+):/g, " $1 ");
+  const laughNormalized = shortcodeNamed
+    .replace(/[wｗ]{2,}/g, " わら ")
+    .replace(/(?<=[ぁ-んァ-ヶ一-龯ー])[wｗ](?=$|[\s!！?？。、「」、,.])/g, "わら")
+    .replace(/(^|[\s!！?？。、「」、,.()（）])([wｗ])(?=$|[\s!！?？。、「」、,.()（）])/g, "$1わら");
+  const normalizedSpaces = laughNormalized.replace(/\s+/g, " ").trim();
   return normalizedSpaces.slice(0, 120);
 }
 
