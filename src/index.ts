@@ -130,6 +130,11 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
+  if (message.content.trim().toLowerCase() === "s") {
+    state.player.stop(true);
+    return;
+  }
+
   const text = normalizeForSpeech(message.content);
   if (!text) {
     return;
@@ -594,7 +599,9 @@ function normalizeForSpeech(content: string): string {
   }
 
   const withoutUrls = trimmed.replace(/https?:\/\/\S+/g, "URL");
-  return withoutUrls.slice(0, 120);
+  const withoutCustomEmojis = withoutUrls.replace(/<a?:\w+:\d+>/g, " ");
+  const normalizedSpaces = withoutCustomEmojis.replace(/\s+/g, " ").trim();
+  return normalizedSpaces.slice(0, 120);
 }
 
 function isJoinableVoiceChannel(channel: VoiceBasedChannel): boolean {
