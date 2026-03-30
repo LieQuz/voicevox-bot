@@ -137,7 +137,7 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
-  const text = normalizeForSpeech(message.content);
+  const text = await normalizeForSpeech(message.content, message);
   if (!text) {
     return;
   }
@@ -594,13 +594,21 @@ async function notifyTextChannel(textChannelId: string, content: string): Promis
   }
 }
 
-function normalizeForSpeech(content: string): string {
+async function normalizeForSpeech(
+  content: string,
+  message: { mentions: { members: { get(id: string): { displayName: string } | undefined } | null } }
+): Promise<string> {
   const trimmed = content.trim();
   if (!trimmed) {
     return "";
   }
 
-  const withoutUrls = trimmed.replace(/https?:\/\/\S+/g, "URL");
+  const withDisplayNames = trimmed.replace(/<@!?(\d+)>/g, (_match, userId: string) => {
+    const member = message.mentions.members?.get(userId);
+    return member ? member.displayName : "ユーザー";
+  });
+
+  const withoutUrls = withDisplayNames.replace(/https?:\/\/\S+/g, "URL");
   const customEmojiNamed = withoutUrls.replace(/<a?:([a-zA-Z0-9_]+):\d+>/g, " $1 ");
   const unicodeEmojiNamed = nodeEmoji.unemojify(customEmojiNamed);
   const shortcodeNamed = unicodeEmojiNamed.replace(/:([a-zA-Z0-9_+-]+):/g, " $1 ");
