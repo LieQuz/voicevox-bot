@@ -137,7 +137,7 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
-  const text = await normalizeForSpeech(message.content, message);
+  const text = await normalizeForSpeech(message.content, message, message.attachments.size > 0);
   if (!text) {
     return;
   }
@@ -596,10 +596,11 @@ async function notifyTextChannel(textChannelId: string, content: string): Promis
 
 async function normalizeForSpeech(
   content: string,
-  message: { mentions: { members: { get(id: string): { displayName: string } | undefined } | null } }
+  message: { mentions: { members: { get(id: string): { displayName: string } | undefined } | null } },
+  hasAttachments: boolean
 ): Promise<string> {
   const trimmed = content.trim();
-  if (!trimmed) {
+  if (!trimmed && !hasAttachments) {
     return "";
   }
 
@@ -608,7 +609,15 @@ async function normalizeForSpeech(
     return member ? member.displayName : "ユーザー";
   });
 
-  const withoutUrls = withDisplayNames.replace(/https?:\/\/\S+/g, "URL");
+  const withLeadingAtRead = withDisplayNames.replace(/^@/, "アット ");
+  const withMediaNotice =
+    hasAttachments && withLeadingAtRead.length > 0
+      ? `${withLeadingAtRead} メディアが投稿されました`
+      : hasAttachments
+        ? "メディアが投稿されました"
+        : withLeadingAtRead;
+
+  const withoutUrls = withMediaNotice.replace(/https?:\/\/\S+/g, "URL");
   const customEmojiNamed = withoutUrls.replace(/<a?:([a-zA-Z0-9_]+):\d+>/g, " $1 ");
   const unicodeEmojiNamed = nodeEmoji.unemojify(customEmojiNamed);
   const shortcodeNamed = unicodeEmojiNamed.replace(/:([a-zA-Z0-9_+-]+):/g, " $1 ");
