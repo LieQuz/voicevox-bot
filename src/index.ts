@@ -20,6 +20,7 @@ import {
   ChannelType,
   Client,
   GatewayIntentBits,
+  PermissionFlagsBits,
   SlashCommandBuilder,
   StringSelectMenuBuilder,
   VoiceBasedChannel
@@ -77,6 +78,11 @@ type SpeakerSelectOption = {
   description: string;
 };
 
+type PronunciationRule = {
+  pattern: string;
+  replacement: string;
+};
+
 type GuildState = {
   connection: VoiceConnection;
   player: AudioPlayer;
@@ -93,6 +99,7 @@ let db: Database;
 let cachedSpeakers: VoicevoxSpeaker[] | null = null;
 let speakersCachedAt = 0;
 let speakerFetchInFlight: Promise<VoicevoxSpeaker[]> | null = null;
+const pronunciationRuleCache = new Map<string, PronunciationRule[]>();
 const speakerSelectPageSize = 25;
 const speakerSelectIdPrefix = "speaker-select";
 const speakerSelectPageIdPrefix = "speaker-select-page";
@@ -110,13 +117,30 @@ const slashCommands = [
   new SlashCommandBuilder().setName("join").setDescription("自分がいるVCにBotを参加させます"),
   new SlashCommandBuilder().setName("leave").setDescription("BotをVCから退出させます"),
   new SlashCommandBuilder().setName("speaker").setDescription("プルダウンで話者を選択します"),
+  new SlashCommandBuilder()
+    .setName("dict")
+    .setDescription("読み替え辞書を管理します")
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("add")
+        .setDescription("読み替え辞書を追加または更新")
+        .addStringOption((option) => option.setName("from").setDescription("置換元").setRequired(true))
+        .addStringOption((option) => option.setName("to").setDescription("置換先").setRequired(true))
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("remove")
+        .setDescription("読み替え辞書を削除")
+        .addStringOption((option) => option.setName("from").setDescription("削除する置換元").setRequired(true))
+    )
+    .addSubcommand((subcommand) => subcommand.setName("list").setDescription("読み替え辞書の一覧を表示")),
   new SlashCommandBuilder().setName("help").setDescription("使い方と主要話者一覧を表示します"),
   new SlashCommandBuilder().setName("speakers").setDescription("話者一覧を表示します")
 ].map((command) => command.toJSON());
 
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user?.tag}`);
-  client.user?.setActivity("/help | /join | /speaker", {
+  client.user?.setActivity("/help | /join | /speaker | /dict", {
     type: ActivityType.Listening
   });
 
@@ -147,7 +171,7 @@ client.on("messageCreate", async (message) => {
     return;
   }
 
-  const text = await normalizeForSpeech(message.content, message, message.attachments.size > 0);
+  const text = await normalizeForSpeech(message.guild.id, message.content, message, message.attachments.size > 0);
   if (!text) {
     return;
   }
@@ -248,6 +272,54 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
+  if (interaction.commandName === "dict") {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      await replyPrivate(interaction, "このコマンドはサーバー管理者（サーバー管理権限）のみ実行できます。");
+      return;
+    }
+
+    const subcommand = interaction.options.getSubcommand();
+    if (subcommand === "add") {
+      const from = interaction.options.getString("from", true).trim();
+      const to = interaction.options.getString("to", true).trim();
+      if (!from || !to) {
+        await replyPrivate(interaction, "`from` と `to` は空文字にできません。");
+        return;
+      }
+
+      await upsertPronunciationRule(interaction.guild.id, from, to);
+      await replyPrivate(interaction, `辞書を保存しました: \`${from}\` → \`${to}\``);
+      return;
+    }
+
+    if (subcommand === "remove") {
+      const from = interaction.options.getString("from", true).trim();
+      if (!from) {
+        await replyPrivate(interaction, "`from` は空文字にできません。");
+        return;
+      }
+
+      const removed = await removePronunciationRule(interaction.guild.id, from);
+      await replyPrivate(
+        interaction,
+        removed ? `辞書から削除しました: \`${from}\`` : `辞書に見つかりませんでした: \`${from}\``
+      );
+      return;
+    }
+
+    if (subcommand === "list") {
+      const rules = await listPronunciationRules(interaction.guild.id);
+      if (rules.length === 0) {
+        await replyPrivate(interaction, "読み替え辞書はまだ登録されていません。");
+        return;
+      }
+
+      const lines = rules.map((rule) => `- ${rule.pattern} -> ${rule.replacement}`);
+      await replyInChunks(interaction, "読み替え辞書一覧:", lines);
+      return;
+    }
+  }
+
   if (interaction.commandName === "help") {
     let speakerLines: string[];
     try {
@@ -262,6 +334,7 @@ client.on("interactionCreate", async (interaction) => {
       "- `/join` : 自分がいるVCにBotを参加",
       "- `/leave` : BotをVCから退出",
       "- `/speaker` : プルダウンであなたの話者IDを保存",
+      "- `/dict` : 読み替え辞書を管理（管理者向け）",
       "- `/speakers` : 話者一覧を見やすく表示",
       "",
       "操作の流れ:",
@@ -287,7 +360,7 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    await replyInChunks(interaction, "話者ID一覧（キャラクターごと）:", lines);
+    await replyInChunks(interaction, "話者ID一覧（キャラクターごと）:", lines, true);
   }
 });
 
@@ -320,6 +393,17 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
 
   if (voiceChannel.type !== ChannelType.GuildVoice && voiceChannel.type !== ChannelType.GuildStageVoice) {
     return;
+  }
+
+  const joinedManagedChannel =
+    oldState.channelId !== state.voiceChannelId && newState.channelId === state.voiceChannelId;
+  if (joinedManagedChannel && newState.member && !newState.member.user.bot) {
+    const joinSpeaker = (await getUserSpeaker(guildId, newState.member.id)) ?? state.speaker;
+    state.queue.push({
+      text: `${newState.member.displayName}が参加しました`,
+      speaker: joinSpeaker
+    });
+    await processQueue(guildId);
   }
 
   const humanMemberCount = [...voiceChannel.members.values()].filter((member) => !member.user.bot).length;
@@ -615,7 +699,8 @@ async function fetchSpeakerDetailedLines(): Promise<string[]> {
 async function replyInChunks(
   interaction: ChatInputCommandInteraction,
   title: string,
-  lines: string[]
+  lines: string[],
+  includeSpeakerTotals = false
 ): Promise<void> {
   const splitLine = (line: string, limit: number): string[] => {
     if (line.length <= limit) {
@@ -650,9 +735,11 @@ async function replyInChunks(
     await replyPrivate(interaction, chunk.trimEnd());
   }
 
-  const totalCharacters = lines.filter((line) => line.startsWith("【")).length;
-  const totalStyles = lines.filter((line) => /^- \d+:/.test(line)).length;
-  await replyPrivate(interaction, `合計 ${totalCharacters} キャラクター / ${totalStyles} スタイル`);
+  if (includeSpeakerTotals) {
+    const totalCharacters = lines.filter((line) => line.startsWith("【")).length;
+    const totalStyles = lines.filter((line) => /^- \d+:/.test(line)).length;
+    await replyPrivate(interaction, `合計 ${totalCharacters} キャラクター / ${totalStyles} スタイル`);
+  }
 }
 
 async function initDatabase(): Promise<void> {
@@ -671,6 +758,16 @@ async function initDatabase(): Promise<void> {
       speaker INTEGER NOT NULL,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (guild_id, user_id)
+    );
+  `);
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS pronunciation_rules (
+      guild_id TEXT NOT NULL,
+      pattern TEXT NOT NULL,
+      replacement TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (guild_id, pattern)
     );
   `);
 }
@@ -700,6 +797,72 @@ async function getUserSpeaker(guildId: string, userId: string): Promise<number |
     userId
   );
   return row?.speaker;
+}
+
+async function getPronunciationRules(guildId: string): Promise<PronunciationRule[]> {
+  const cached = pronunciationRuleCache.get(guildId);
+  if (cached) {
+    return cached;
+  }
+
+  const rows = await db.all<PronunciationRule[]>(
+    `
+      SELECT pattern, replacement
+      FROM pronunciation_rules
+      WHERE guild_id = ?
+      ORDER BY LENGTH(pattern) DESC, pattern ASC;
+    `,
+    guildId
+  );
+  pronunciationRuleCache.set(guildId, rows);
+  return rows;
+}
+
+async function upsertPronunciationRule(guildId: string, pattern: string, replacement: string): Promise<void> {
+  await db.run(
+    `
+      INSERT INTO pronunciation_rules (guild_id, pattern, replacement)
+      VALUES (?, ?, ?)
+      ON CONFLICT(guild_id, pattern)
+      DO UPDATE SET replacement = excluded.replacement, updated_at = CURRENT_TIMESTAMP;
+    `,
+    guildId,
+    pattern,
+    replacement
+  );
+  pronunciationRuleCache.delete(guildId);
+}
+
+async function removePronunciationRule(guildId: string, pattern: string): Promise<boolean> {
+  const result = await db.run(
+    `
+      DELETE FROM pronunciation_rules
+      WHERE guild_id = ? AND pattern = ?;
+    `,
+    guildId,
+    pattern
+  );
+  pronunciationRuleCache.delete(guildId);
+  return (result.changes ?? 0) > 0;
+}
+
+async function listPronunciationRules(guildId: string): Promise<PronunciationRule[]> {
+  return getPronunciationRules(guildId);
+}
+
+function escapeRegExp(source: string): string {
+  return source.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function applyPronunciationRules(text: string, rules: PronunciationRule[]): string {
+  let output = text;
+  for (const rule of rules) {
+    if (!rule.pattern) {
+      continue;
+    }
+    output = output.replace(new RegExp(escapeRegExp(rule.pattern), "g"), rule.replacement);
+  }
+  return output;
 }
 
 async function saveTempWav(audio: Buffer): Promise<string> {
@@ -758,6 +921,7 @@ async function notifyTextChannel(textChannelId: string, content: string): Promis
 }
 
 async function normalizeForSpeech(
+  guildId: string,
   content: string,
   message: { mentions: { members: { get(id: string): { displayName: string } | undefined } | null } },
   hasAttachments: boolean
@@ -779,8 +943,10 @@ async function normalizeForSpeech(
       : hasAttachments
         ? "メディアが投稿されました"
         : withLeadingAtRead;
+  const pronunciationRules = await getPronunciationRules(guildId);
+  const replacedByDictionary = applyPronunciationRules(withMediaNotice, pronunciationRules);
 
-  const withoutUrls = withMediaNotice.replace(/https?:\/\/\S+/g, "URL");
+  const withoutUrls = replacedByDictionary.replace(/https?:\/\/\S+/g, "URL");
   const customEmojiNamed = withoutUrls.replace(/<a?:([a-zA-Z0-9_]+):\d+>/g, " $1 ");
   const unicodeEmojiNamed = nodeEmoji.unemojify(customEmojiNamed);
   const shortcodeNamed = unicodeEmojiNamed.replace(/:([a-zA-Z0-9_+-]+):/g, " $1 ");
