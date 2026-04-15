@@ -211,14 +211,14 @@ client.on("interactionCreate", async (interaction) => {
   if (interaction.commandName === "speakers") {
     let lines: string[];
     try {
-      lines = await fetchSpeakerSummaryLines();
+      lines = await fetchSpeakerDetailedLines();
     } catch (error) {
       console.error("Failed to fetch speaker list:", error);
       await replyPrivate(interaction, "話者一覧の取得に失敗しました（VOICEVOX接続を確認してください）。");
       return;
     }
 
-    await replyInChunks(interaction, "話者ID一覧:", lines);
+    await replyInChunks(interaction, "話者ID一覧（キャラクターごと）:", lines);
   }
 });
 
@@ -447,6 +447,28 @@ async function fetchSpeakerSummaryLines(limit?: number): Promise<string[]> {
   return lines.slice(0, limit);
 }
 
+async function fetchSpeakerDetailedLines(): Promise<string[]> {
+  const speakers = await fetchVoicevoxSpeakers();
+  if (speakers.length === 0) {
+    return ["- 話者一覧が空です"];
+  }
+
+  const lines: string[] = [];
+  for (const speaker of speakers) {
+    lines.push(`【${speaker.name}】`);
+    for (const style of speaker.styles) {
+      lines.push(`- ${style.id}: ${style.name}`);
+    }
+    lines.push("");
+  }
+
+  if (lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+
+  return lines;
+}
+
 async function replyInChunks(
   interaction: ChatInputCommandInteraction,
   title: string,
@@ -485,11 +507,9 @@ async function replyInChunks(
     await replyPrivate(interaction, chunk.trimEnd());
   }
 
-  const totalStyles = lines.reduce(
-    (count, line) => count + (line.match(/\d+:/g)?.length ?? 0),
-    0
-  );
-  await replyPrivate(interaction, `合計 ${lines.length} キャラクター / ${totalStyles} スタイル`);
+  const totalCharacters = lines.filter((line) => line.startsWith("【")).length;
+  const totalStyles = lines.filter((line) => /^- \d+:/.test(line)).length;
+  await replyPrivate(interaction, `合計 ${totalCharacters} キャラクター / ${totalStyles} スタイル`);
 }
 
 async function initDatabase(): Promise<void> {
