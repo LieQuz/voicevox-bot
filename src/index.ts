@@ -406,6 +406,16 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
     await processQueue(guildId);
   }
 
+  const leftManagedChannel = oldState.channelId === state.voiceChannelId && newState.channelId !== state.voiceChannelId;
+  if (leftManagedChannel && oldState.member && !oldState.member.user.bot) {
+    const leaveSpeaker = (await getUserSpeaker(guildId, oldState.member.id)) ?? state.speaker;
+    state.queue.push({
+      text: `${oldState.member.displayName}が退出しました`,
+      speaker: leaveSpeaker
+    });
+    await processQueue(guildId);
+  }
+
   const humanMemberCount = [...voiceChannel.members.values()].filter((member) => !member.user.bot).length;
   if (humanMemberCount === 0) {
     await disconnectGuild(guildId);
