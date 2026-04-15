@@ -7,7 +7,7 @@
 
 - `/join`: 実行者がいるボイスチャンネルへ参加
 - `/leave`: ボイスチャンネルから退出
-- `/speaker id:<id>`: 自分の話者IDを変更（永続化）
+- `/speaker`: プルダウンから自分の話者IDを変更（永続化）
 - `/speakers`: 話者一覧を見やすく表示
 - `/help`: コマンド一覧 + 主要話者一覧（先頭8件）を表示
 - `/join` を実行したテキストチャンネルの通常メッセージを読み上げ
@@ -19,7 +19,7 @@
 - `w` / `ｗ` は読み上げ時に正規化（単体は `わら`、2文字以上は `わらわら`）
 - ユーザーごとの話者IDを SQLite に永続保存（Bot再起動後も維持）
 - VCの人間メンバーが0人になると自動で退出
-- BotのDiscordステータスに `/help / /join / /speaker 3` の操作ヒントを表示
+- BotのDiscordステータスに `/help / /join / /speaker` の操作ヒントを表示
 - コマンド応答は全て ephemeral（実行者のみ表示）
 
 ## 事前準備（Discord側）
@@ -84,7 +84,7 @@ DEFAULT_SPEED_SCALE=1.2
 SPEAKER_CACHE_TTL_MS=300000
 ```
 
-`!speaker <id>` は「実行したユーザー自身」の設定を保存します。  
+`/speaker` のプルダウン選択は「実行したユーザー自身」の設定を保存します。  
 保存先DB: `data/voicevox-bot.sqlite3`
 
 ## VOICEVOX Engine 起動（Docker）

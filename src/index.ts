@@ -12,12 +12,16 @@ import {
   joinVoiceChannel
 } from "@discordjs/voice";
 import {
+  ActionRowBuilder,
   ActivityType,
+  ButtonBuilder,
+  ButtonStyle,
   ChatInputCommandInteraction,
   ChannelType,
   Client,
   GatewayIntentBits,
   SlashCommandBuilder,
+  StringSelectMenuBuilder,
   VoiceBasedChannel
 } from "discord.js";
 import nodeEmoji = require("node-emoji");
@@ -67,6 +71,12 @@ type QueueItem = {
   speaker: number;
 };
 
+type SpeakerSelectOption = {
+  value: string;
+  label: string;
+  description: string;
+};
+
 type GuildState = {
   connection: VoiceConnection;
   player: AudioPlayer;
@@ -83,6 +93,9 @@ let db: Database;
 let cachedSpeakers: VoicevoxSpeaker[] | null = null;
 let speakersCachedAt = 0;
 let speakerFetchInFlight: Promise<VoicevoxSpeaker[]> | null = null;
+const speakerSelectPageSize = 25;
+const speakerSelectIdPrefix = "speaker-select";
+const speakerSelectPageIdPrefix = "speaker-select-page";
 
 const client = new Client({
   intents: [
@@ -96,17 +109,14 @@ const client = new Client({
 const slashCommands = [
   new SlashCommandBuilder().setName("join").setDescription("自分がいるVCにBotを参加させます"),
   new SlashCommandBuilder().setName("leave").setDescription("BotをVCから退出させます"),
-  new SlashCommandBuilder()
-    .setName("speaker")
-    .setDescription("あなたの話者IDを保存します")
-    .addIntegerOption((option) => option.setName("id").setDescription("話者ID").setRequired(true)),
+  new SlashCommandBuilder().setName("speaker").setDescription("プルダウンで話者を選択します"),
   new SlashCommandBuilder().setName("help").setDescription("使い方と主要話者一覧を表示します"),
   new SlashCommandBuilder().setName("speakers").setDescription("話者一覧を表示します")
 ].map((command) => command.toJSON());
 
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user?.tag}`);
-  client.user?.setActivity("/help | /join | /speaker 3", {
+  client.user?.setActivity("/help | /join | /speaker", {
     type: ActivityType.Listening
   });
 
@@ -153,6 +163,53 @@ client.on("messageCreate", async (message) => {
 });
 
 client.on("interactionCreate", async (interaction) => {
+  if (interaction.isStringSelectMenu() && interaction.customId.startsWith(`${speakerSelectIdPrefix}:`)) {
+    const parsed = parseSpeakerComponentId(interaction.customId, speakerSelectIdPrefix);
+    if (!interaction.guild || !parsed) {
+      return;
+    }
+
+    if (parsed.userId !== interaction.user.id) {
+      await interaction.reply({ content: "このプルダウンはコマンド実行者のみ操作できます。", ephemeral: true });
+      return;
+    }
+
+    const speaker = Number.parseInt(interaction.values[0] ?? "", 10);
+    if (Number.isNaN(speaker) || speaker <= 0) {
+      await interaction.reply({ content: "話者IDの読み取りに失敗しました。", ephemeral: true });
+      return;
+    }
+
+    await setUserSpeaker(interaction.guild.id, interaction.user.id, speaker);
+    await interaction.update({
+      content: `あなたの話者IDを ${speaker} に保存しました。`,
+      components: []
+    });
+    return;
+  }
+
+  if (interaction.isButton() && interaction.customId.startsWith(`${speakerSelectPageIdPrefix}:`)) {
+    const parsed = parseSpeakerComponentId(interaction.customId, speakerSelectPageIdPrefix);
+    if (!interaction.guild || !parsed) {
+      return;
+    }
+
+    if (parsed.userId !== interaction.user.id) {
+      await interaction.reply({ content: "このプルダウンはコマンド実行者のみ操作できます。", ephemeral: true });
+      return;
+    }
+
+    const options = await fetchSpeakerSelectOptions();
+    const maxPage = Math.max(Math.ceil(options.length / speakerSelectPageSize) - 1, 0);
+    const page = Math.min(Math.max(parsed.page, 0), maxPage);
+    const components = buildSpeakerPickerComponents(options, interaction.user.id, page);
+    await interaction.update({
+      content: "プルダウンから話者を選んでください。",
+      components
+    });
+    return;
+  }
+
   if (!interaction.isChatInputCommand() || !interaction.guild) {
     return;
   }
@@ -168,14 +225,26 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   if (interaction.commandName === "speaker") {
-    const speaker = interaction.options.getInteger("id", true);
-    if (speaker <= 0) {
-      await replyPrivate(interaction, "`/speaker id:<number>` で話者IDを指定してください。");
+    let options: SpeakerSelectOption[];
+    try {
+      options = await fetchSpeakerSelectOptions();
+    } catch (error) {
+      console.error("Failed to fetch speaker list:", error);
+      await replyPrivate(interaction, "話者一覧の取得に失敗しました（VOICEVOX接続を確認してください）。");
       return;
     }
 
-    await setUserSpeaker(interaction.guild.id, interaction.user.id, speaker);
-    await replyPrivate(interaction, `あなたの話者IDを ${speaker} に保存しました。`);
+    if (options.length === 0) {
+      await replyPrivate(interaction, "話者一覧が空です。");
+      return;
+    }
+
+    const components = buildSpeakerPickerComponents(options, interaction.user.id, 0);
+    await interaction.reply({
+      content: "プルダウンから話者を選んでください。",
+      components,
+      ephemeral: true
+    });
     return;
   }
 
@@ -192,12 +261,12 @@ client.on("interactionCreate", async (interaction) => {
       "コマンド一覧:",
       "- `/join` : 自分がいるVCにBotを参加",
       "- `/leave` : BotをVCから退出",
-      "- `/speaker id:<number>` : あなたの話者IDを保存",
+      "- `/speaker` : プルダウンであなたの話者IDを保存",
       "- `/speakers` : 話者一覧を見やすく表示",
       "",
       "操作の流れ:",
       "1) `/join` でVC参加",
-      "2) `/speaker id:3` で自分の話者を設定",
+      "2) `/speaker` でプルダウンから自分の話者を設定",
       "3) テキストを送信すると読み上げ",
       "",
       "話者ID一覧（先頭8件）:",
@@ -445,6 +514,80 @@ async function fetchSpeakerSummaryLines(limit?: number): Promise<string[]> {
   }
 
   return lines.slice(0, limit);
+}
+
+async function fetchSpeakerSelectOptions(): Promise<SpeakerSelectOption[]> {
+  const speakers = await fetchVoicevoxSpeakers();
+  const options: SpeakerSelectOption[] = [];
+
+  for (const speaker of speakers) {
+    for (const style of speaker.styles) {
+      const label = `${speaker.name} / ${style.name}`.slice(0, 100);
+      const description = `話者ID: ${style.id}`.slice(0, 100);
+      options.push({
+        value: String(style.id),
+        label,
+        description
+      });
+    }
+  }
+
+  return options;
+}
+
+function buildSpeakerPickerComponents(
+  options: SpeakerSelectOption[],
+  userId: string,
+  page: number
+): Array<ActionRowBuilder<StringSelectMenuBuilder> | ActionRowBuilder<ButtonBuilder>> {
+  const maxPage = Math.max(Math.ceil(options.length / speakerSelectPageSize) - 1, 0);
+  const currentPage = Math.min(Math.max(page, 0), maxPage);
+  const start = currentPage * speakerSelectPageSize;
+  const pageOptions = options.slice(start, start + speakerSelectPageSize);
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(`${speakerSelectIdPrefix}:${userId}:${currentPage}`)
+    .setPlaceholder(`話者を選択 (${currentPage + 1}/${maxPage + 1})`)
+    .addOptions(pageOptions);
+
+  const rows: Array<ActionRowBuilder<StringSelectMenuBuilder> | ActionRowBuilder<ButtonBuilder>> = [
+    new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)
+  ];
+
+  if (maxPage > 0) {
+    const prevButton = new ButtonBuilder()
+      .setCustomId(`${speakerSelectPageIdPrefix}:${userId}:${currentPage - 1}`)
+      .setLabel("前へ")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(currentPage <= 0);
+
+    const nextButton = new ButtonBuilder()
+      .setCustomId(`${speakerSelectPageIdPrefix}:${userId}:${currentPage + 1}`)
+      .setLabel("次へ")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(currentPage >= maxPage);
+
+    rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(prevButton, nextButton));
+  }
+
+  return rows;
+}
+
+function parseSpeakerComponentId(
+  customId: string,
+  prefix: string
+): { userId: string; page: number } | undefined {
+  const [parsedPrefix, userId, pageText] = customId.split(":");
+  if (parsedPrefix !== prefix || !userId || !pageText) {
+    return undefined;
+  }
+
+  const page = Number.parseInt(pageText, 10);
+  if (Number.isNaN(page)) {
+    return undefined;
+  }
+
+  return { userId, page };
 }
 
 async function fetchSpeakerDetailedLines(): Promise<string[]> {
