@@ -7,6 +7,8 @@
 
 - `/join`: 実行者がいるボイスチャンネルへ参加
 - `/leave`: ボイスチャンネルから退出
+- `/autojoin`: ユーザー参加時のVC自動参加をサーバーごとにON/OFF（管理者向け）
+- `/autojoin-channel`: 自動参加時の読み上げ対象テキストチャンネルをサーバーごとに設定（管理者向け）
 - `/speaker`: プルダウンから自分の話者IDを変更（永続化）
 - `/dict`: サーバー用の読み替え辞書を管理（管理者向け）
 - `/speakers`: 話者一覧を見やすく表示
@@ -20,6 +22,7 @@
 - 絵文字は読み上げ用に名前へ変換（サーバーカスタム絵文字は名前、通常絵文字は英語shortcode名）
 - `w` / `ｗ` は読み上げ時に正規化（単体は `わら`、2文字以上は `わらわら`）
 - ユーザーごとの話者IDを SQLite に永続保存（Bot再起動後も維持）
+- VC自動参加設定と自動参加時の読み上げ対象テキストチャンネルをSQLiteに永続保存
 - VCの人間メンバーが0人になると自動で退出
 - BotのDiscordステータスに `/help / /join / /speaker` の操作ヒントを表示
 - コマンド応答は全て ephemeral（実行者のみ表示）
@@ -94,6 +97,12 @@ SPEAKER_CACHE_TTL_MS=300000
 - `/dict add from:LOL to:えるおーえる`
 - `/dict remove from:LOL`
 - `/dict list`
+
+VC自動参加を使う場合は、管理者が以下を設定します:
+- `/autojoin enabled:true` または `/autojoin enabled:false`
+- `/autojoin-channel channel:#読み上げ対象チャンネル`
+
+設定保存先はユーザー話者・辞書と同じ `data/voicevox-bot.sqlite3` です。
 
 ## VOICEVOX Engine 起動（Docker）
 

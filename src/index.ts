@@ -23,6 +23,7 @@ import {
   PermissionFlagsBits,
   SlashCommandBuilder,
   StringSelectMenuBuilder,
+  VoiceState,
   VoiceBasedChannel
 } from "discord.js";
 import nodeEmoji = require("node-emoji");
@@ -89,12 +90,13 @@ type GuildState = {
   queue: QueueItem[];
   processing: boolean;
   speaker: number;
-  textChannelId: string;
+  textChannelId?: string;
   voiceChannelId: string;
   currentTempFile?: string;
 };
 
 const guildStates = new Map<string, GuildState>();
+const autoJoinInFlight = new Map<string, Promise<void>>();
 let db: Database;
 let cachedSpeakers: VoicevoxSpeaker[] | null = null;
 let speakersCachedAt = 0;
@@ -116,6 +118,22 @@ const client = new Client({
 const slashCommands = [
   new SlashCommandBuilder().setName("join").setDescription("自分がいるVCにBotを参加させます"),
   new SlashCommandBuilder().setName("leave").setDescription("BotをVCから退出させます"),
+  new SlashCommandBuilder()
+    .setName("autojoin")
+    .setDescription("ユーザーがVCへ参加したときのBot自動参加を設定します")
+    .addBooleanOption((option) =>
+      option.setName("enabled").setDescription("自動参加を有効にするか").setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("autojoin-channel")
+    .setDescription("自動参加時の読み上げ対象テキストチャンネルを設定します")
+    .addChannelOption((option) =>
+      option
+        .setName("channel")
+        .setDescription("読み上げ対象にするテキストチャンネル")
+        .addChannelTypes(ChannelType.GuildText)
+        .setRequired(true)
+    ),
   new SlashCommandBuilder().setName("speaker").setDescription("プルダウンで話者を選択します"),
   new SlashCommandBuilder()
     .setName("dict")
@@ -140,7 +158,7 @@ const slashCommands = [
 
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user?.tag}`);
-  client.user?.setActivity("/help | /join | /speaker | /dict", {
+  client.user?.setActivity("/help | /join | /speaker | /dict | /autojoin", {
     type: ActivityType.Listening
   });
 
@@ -248,6 +266,35 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
+  if (interaction.commandName === "autojoin") {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      await replyPrivate(interaction, "このコマンドはサーバー管理者（サーバー管理権限）のみ実行できます。");
+      return;
+    }
+
+    const enabled = interaction.options.getBoolean("enabled", true);
+    await setGuildAutoJoinEnabled(interaction.guild.id, enabled);
+    await replyPrivate(interaction, `VC自動参加を${enabled ? "ON" : "OFF"}にしました。`);
+    return;
+  }
+
+  if (interaction.commandName === "autojoin-channel") {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      await replyPrivate(interaction, "このコマンドはサーバー管理者（サーバー管理権限）のみ実行できます。");
+      return;
+    }
+
+    const channel = interaction.options.getChannel("channel", true);
+    if (channel.type !== ChannelType.GuildText) {
+      await replyPrivate(interaction, "テキストチャンネルを指定してください。");
+      return;
+    }
+
+    await setGuildAutoJoinTextChannel(interaction.guild.id, channel.id);
+    await replyPrivate(interaction, `自動参加時の読み上げ対象を <#${channel.id}> に設定しました。`);
+    return;
+  }
+
   if (interaction.commandName === "speaker") {
     let options: SpeakerSelectOption[];
     try {
@@ -333,6 +380,8 @@ client.on("interactionCreate", async (interaction) => {
       "コマンド一覧:",
       "- `/join` : 自分がいるVCにBotを参加",
       "- `/leave` : BotをVCから退出",
+      "- `/autojoin` : ユーザー参加時のVC自動参加をON/OFF（管理者向け）",
+      "- `/autojoin-channel` : 自動参加時の読み上げ対象を設定（管理者向け）",
       "- `/speaker` : プルダウンであなたの話者IDを保存",
       "- `/dict` : 読み替え辞書を管理（管理者向け）",
       "- `/speakers` : 話者一覧を見やすく表示",
@@ -366,6 +415,23 @@ client.on("interactionCreate", async (interaction) => {
 
 client.on("voiceStateUpdate", async (oldState, newState) => {
   const guildId = newState.guild.id;
+  const humanJoinedVoiceChannel =
+    oldState.channelId !== newState.channelId &&
+    newState.channelId !== null &&
+    newState.member !== null &&
+    !newState.member.user.bot;
+  if (humanJoinedVoiceChannel && !(guildStates.has(guildId) || autoJoinInFlight.has(guildId))) {
+    const autoJoinPromise = tryAutoJoinGuild(guildId, newState);
+    autoJoinInFlight.set(guildId, autoJoinPromise);
+    try {
+      await autoJoinPromise;
+    } catch (error) {
+      console.error(`Failed to auto-join voice channel in guild ${guildId}:`, error);
+    } finally {
+      autoJoinInFlight.delete(guildId);
+    }
+  }
+
   const state = guildStates.get(guildId);
   if (!state) {
     return;
@@ -474,6 +540,51 @@ async function joinCommand(interaction: ChatInputCommandInteraction): Promise<vo
   });
 
   await replyPrivate(interaction, "VCへ参加しました。このチャンネルのメッセージを読み上げます。");
+}
+
+async function tryAutoJoinGuild(guildId: string, voiceState: VoiceState): Promise<void> {
+  if (!(await getGuildAutoJoinEnabled(guildId))) {
+    return;
+  }
+
+  const textChannelId = await getGuildAutoJoinTextChannel(guildId);
+  await autoJoinVoiceChannel(guildId, voiceState, textChannelId);
+}
+
+async function autoJoinVoiceChannel(
+  guildId: string,
+  voiceState: VoiceState,
+  textChannelId: string | undefined
+): Promise<void> {
+  const voiceChannel = voiceState.channel;
+  if (!voiceChannel || !isJoinableVoiceChannel(voiceChannel) || guildStates.has(guildId)) {
+    return;
+  }
+
+  const connection = joinVoiceChannel({
+    channelId: voiceChannel.id,
+    guildId: voiceChannel.guild.id,
+    adapterCreator: voiceChannel.guild.voiceAdapterCreator
+  });
+
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+  } catch (error) {
+    connection.destroy();
+    throw error;
+  }
+
+  const player = createAudioPlayer();
+  connection.subscribe(player);
+  guildStates.set(guildId, {
+    connection,
+    player,
+    queue: [],
+    processing: false,
+    speaker: defaultSpeaker,
+    textChannelId,
+    voiceChannelId: voiceChannel.id
+  });
 }
 
 async function leaveCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -780,6 +891,57 @@ async function initDatabase(): Promise<void> {
       PRIMARY KEY (guild_id, pattern)
     );
   `);
+
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS guild_settings (
+      guild_id TEXT NOT NULL PRIMARY KEY,
+      autojoin_enabled INTEGER NOT NULL DEFAULT 0 CHECK (autojoin_enabled IN (0, 1)),
+      autojoin_text_channel_id TEXT,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+}
+
+async function setGuildAutoJoinEnabled(guildId: string, enabled: boolean): Promise<void> {
+  await db.run(
+    `
+      INSERT INTO guild_settings (guild_id, autojoin_enabled)
+      VALUES (?, ?)
+      ON CONFLICT(guild_id)
+      DO UPDATE SET autojoin_enabled = excluded.autojoin_enabled, updated_at = CURRENT_TIMESTAMP;
+    `,
+    guildId,
+    enabled ? 1 : 0
+  );
+}
+
+async function getGuildAutoJoinEnabled(guildId: string): Promise<boolean> {
+  const row = await db.get<{ autojoin_enabled: number }>(
+    "SELECT autojoin_enabled FROM guild_settings WHERE guild_id = ?;",
+    guildId
+  );
+  return row?.autojoin_enabled === 1;
+}
+
+async function setGuildAutoJoinTextChannel(guildId: string, channelId: string): Promise<void> {
+  await db.run(
+    `
+      INSERT INTO guild_settings (guild_id, autojoin_text_channel_id)
+      VALUES (?, ?)
+      ON CONFLICT(guild_id)
+      DO UPDATE SET autojoin_text_channel_id = excluded.autojoin_text_channel_id, updated_at = CURRENT_TIMESTAMP;
+    `,
+    guildId,
+    channelId
+  );
+}
+
+async function getGuildAutoJoinTextChannel(guildId: string): Promise<string | undefined> {
+  const row = await db.get<{ autojoin_text_channel_id: string | null }>(
+    "SELECT autojoin_text_channel_id FROM guild_settings WHERE guild_id = ?;",
+    guildId
+  );
+  return row?.autojoin_text_channel_id ?? undefined;
 }
 
 async function setUserSpeaker(guildId: string, userId: string, speaker: number): Promise<void> {
@@ -923,7 +1085,10 @@ async function replyPrivate(interaction: ChatInputCommandInteraction, content: s
   await interaction.reply({ content, ephemeral: true });
 }
 
-async function notifyTextChannel(textChannelId: string, content: string): Promise<void> {
+async function notifyTextChannel(textChannelId: string | undefined, content: string): Promise<void> {
+  if (!textChannelId) {
+    return;
+  }
   const channel = await client.channels.fetch(textChannelId);
   if (channel?.isTextBased() && "send" in channel) {
     await channel.send(content);
