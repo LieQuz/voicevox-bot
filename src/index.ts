@@ -20,7 +20,10 @@ import {
   ChatInputCommandInteraction,
   ChannelType,
   Client,
+  EmbedBuilder,
   GatewayIntentBits,
+  GuildBasedChannel,
+  GuildMember,
   PermissionFlagsBits,
   SlashCommandBuilder,
   StringSelectMenuBuilder,
@@ -156,6 +159,22 @@ const slashCommands = [
         .setName("channel")
         .setDescription("読み上げ対象にするテキストチャンネル")
         .addChannelTypes(ChannelType.GuildText)
+        .setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("vc-notify")
+    .setDescription("VC参加/退出の埋め込み通知をON/OFFします（管理者向け）")
+    .addBooleanOption((option) =>
+      option.setName("enabled").setDescription("通知を有効にするか").setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("vc-notify-channel")
+    .setDescription("VC参加/退出の埋め込み通知先テキストチャンネルを設定します（管理者向け）")
+    .addChannelOption((option) =>
+      option
+        .setName("channel")
+        .setDescription("通知を送るテキストチャンネル")
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
         .setRequired(true)
     ),
   new SlashCommandBuilder().setName("speaker").setDescription("プルダウンで話者を選択します"),
@@ -343,6 +362,35 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
+  if (interaction.commandName === "vc-notify") {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      await replyPrivate(interaction, "このコマンドはサーバー管理者（サーバー管理権限）のみ実行できます。");
+      return;
+    }
+
+    const enabled = interaction.options.getBoolean("enabled", true);
+    await setGuildVcNotifyEnabled(interaction.guild.id, enabled);
+    await replyPrivate(interaction, `VC参加/退出の埋め込み通知を${enabled ? "ON" : "OFF"}にしました。`);
+    return;
+  }
+
+  if (interaction.commandName === "vc-notify-channel") {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      await replyPrivate(interaction, "このコマンドはサーバー管理者（サーバー管理権限）のみ実行できます。");
+      return;
+    }
+
+    const channel = interaction.options.getChannel("channel", true);
+    if (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement) {
+      await replyPrivate(interaction, "テキストチャンネルを指定してください。");
+      return;
+    }
+
+    await setGuildVcNotifyChannel(interaction.guild.id, channel.id);
+    await replyPrivate(interaction, `VC参加/退出の通知先を <#${channel.id}> に設定しました。`);
+    return;
+  }
+
   if (interaction.commandName === "speaker") {
     let options: SpeakerSelectOption[];
     try {
@@ -430,6 +478,8 @@ client.on("interactionCreate", async (interaction) => {
       "- `/leave` : BotをVCから退出",
       "- `/autojoin` : ユーザー参加時のVC自動参加をON/OFF（管理者向け）",
       "- `/autojoin-channel` : 自動参加時の読み上げ対象を設定（管理者向け）",
+      "- `/vc-notify` : VC参加/退出の埋め込み通知をON/OFF（管理者向け）",
+      "- `/vc-notify-channel` : VC参加/退出の通知先テキストチャンネルを設定（管理者向け）",
       "- `/speaker` : プルダウンであなたの話者IDを保存",
       "- `/dict` : 読み替え辞書を管理（管理者向け）",
       "- `/default-speaker` : サーバーの標準話者IDを設定（管理者向け）",
@@ -468,6 +518,8 @@ client.on("interactionCreate", async (interaction) => {
 
 client.on("voiceStateUpdate", async (oldState, newState) => {
   try {
+  await notifyGuildVcActivityEmbeds(oldState, newState);
+
   const guildId = newState.guild.id;
   const humanJoinedVoiceChannel =
     oldState.channelId !== newState.channelId &&
@@ -964,12 +1016,26 @@ async function initDatabase(): Promise<void> {
       autojoin_enabled INTEGER NOT NULL DEFAULT 0 CHECK (autojoin_enabled IN (0, 1)),
       autojoin_text_channel_id TEXT,
       default_speaker INTEGER,
+      vc_notify_enabled INTEGER NOT NULL DEFAULT 0 CHECK (vc_notify_enabled IN (0, 1)),
+      vc_notify_channel_id TEXT,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
   `);
 
   try {
     await db.exec(`ALTER TABLE guild_settings ADD COLUMN default_speaker INTEGER;`);
+  } catch {
+    // column already exists
+  }
+
+  try {
+    await db.exec(`ALTER TABLE guild_settings ADD COLUMN vc_notify_enabled INTEGER NOT NULL DEFAULT 0;`);
+  } catch {
+    // column already exists
+  }
+
+  try {
+    await db.exec(`ALTER TABLE guild_settings ADD COLUMN vc_notify_channel_id TEXT;`);
   } catch {
     // column already exists
   }
@@ -1039,6 +1105,48 @@ async function getGuildAutoJoinTextChannel(guildId: string): Promise<string | un
     guildId
   );
   return row?.autojoin_text_channel_id ?? undefined;
+}
+
+async function setGuildVcNotifyEnabled(guildId: string, enabled: boolean): Promise<void> {
+  await db.run(
+    `
+      INSERT INTO guild_settings (guild_id, vc_notify_enabled)
+      VALUES (?, ?)
+      ON CONFLICT(guild_id)
+      DO UPDATE SET vc_notify_enabled = excluded.vc_notify_enabled, updated_at = CURRENT_TIMESTAMP;
+    `,
+    guildId,
+    enabled ? 1 : 0
+  );
+}
+
+async function getGuildVcNotifyEnabled(guildId: string): Promise<boolean> {
+  const row = await db.get<{ vc_notify_enabled: number }>(
+    "SELECT vc_notify_enabled FROM guild_settings WHERE guild_id = ?;",
+    guildId
+  );
+  return row?.vc_notify_enabled === 1;
+}
+
+async function setGuildVcNotifyChannel(guildId: string, channelId: string): Promise<void> {
+  await db.run(
+    `
+      INSERT INTO guild_settings (guild_id, vc_notify_channel_id)
+      VALUES (?, ?)
+      ON CONFLICT(guild_id)
+      DO UPDATE SET vc_notify_channel_id = excluded.vc_notify_channel_id, updated_at = CURRENT_TIMESTAMP;
+    `,
+    guildId,
+    channelId
+  );
+}
+
+async function getGuildVcNotifyChannel(guildId: string): Promise<string | undefined> {
+  const row = await db.get<{ vc_notify_channel_id: string | null }>(
+    "SELECT vc_notify_channel_id FROM guild_settings WHERE guild_id = ?;",
+    guildId
+  );
+  return row?.vc_notify_channel_id ?? undefined;
 }
 
 async function setUserSpeaker(guildId: string, userId: string, speaker: number): Promise<void> {
@@ -1270,6 +1378,90 @@ async function notifyTextChannel(textChannelId: string | undefined, content: str
   }
 }
 
+async function resolveVoiceChannel(
+  voiceState: VoiceState,
+  channelId: string | null
+): Promise<VoiceBasedChannel | null> {
+  if (!channelId) {
+    return null;
+  }
+
+  const cached = voiceState.guild.channels.cache.get(channelId);
+  if (cached && isJoinableVoiceChannel(cached)) {
+    return cached;
+  }
+
+  const fetched = await voiceState.guild.channels.fetch(channelId).catch(() => null);
+  if (fetched && isJoinableVoiceChannel(fetched)) {
+    return fetched;
+  }
+
+  return null;
+}
+
+async function sendVcActivityEmbed(
+  textChannelId: string,
+  member: GuildMember,
+  voiceChannel: VoiceBasedChannel,
+  kind: "join" | "leave"
+): Promise<void> {
+  const channel = await client.channels.fetch(textChannelId);
+  if (!channel?.isTextBased() || !("send" in channel)) {
+    return;
+  }
+
+  const action = kind === "join" ? "参加しました" : "退出しました";
+  const embed = new EmbedBuilder()
+    .setColor(kind === "join" ? 0x57f287 : 0xed4245)
+    .setDescription(`${member} が VCチャンネル <#${voiceChannel.id}> に${action}。`)
+    .setTimestamp();
+
+  await channel.send({ embeds: [embed] });
+}
+
+async function notifyGuildVcActivityEmbeds(oldState: VoiceState, newState: VoiceState): Promise<void> {
+  const guildId = newState.guild.id;
+  if (!(await getGuildVcNotifyEnabled(guildId))) {
+    return;
+  }
+
+  const notifyChannelId = await getGuildVcNotifyChannel(guildId);
+  if (!notifyChannelId) {
+    return;
+  }
+
+  const member = newState.member ?? oldState.member;
+  if (!member || member.user.bot) {
+    return;
+  }
+
+  if (oldState.channelId === newState.channelId) {
+    return;
+  }
+
+  if (newState.channelId && oldState.channelId !== newState.channelId) {
+    const joinedChannel = await resolveVoiceChannel(newState, newState.channelId);
+    if (joinedChannel) {
+      try {
+        await sendVcActivityEmbed(notifyChannelId, member, joinedChannel, "join");
+      } catch (error) {
+        console.error(`Failed to send VC join embed in guild ${guildId}:`, error);
+      }
+    }
+  }
+
+  if (oldState.channelId && oldState.channelId !== newState.channelId) {
+    const leftChannel = await resolveVoiceChannel(oldState, oldState.channelId);
+    if (leftChannel) {
+      try {
+        await sendVcActivityEmbed(notifyChannelId, member, leftChannel, "leave");
+      } catch (error) {
+        console.error(`Failed to send VC leave embed in guild ${guildId}:`, error);
+      }
+    }
+  }
+}
+
 type SpeechMessageContext = {
   mentions: { members: { get(id: string): { displayName: string } | undefined } | null };
   guild: { channels: { cache: { get(id: string): { name: string } | undefined } } } | null;
@@ -1349,7 +1541,7 @@ async function normalizeForSpeech(
   return normalizedSpaces.slice(0, 120);
 }
 
-function isJoinableVoiceChannel(channel: VoiceBasedChannel): boolean {
+function isJoinableVoiceChannel(channel: GuildBasedChannel): channel is VoiceBasedChannel {
   return channel.type === ChannelType.GuildVoice || channel.type === ChannelType.GuildStageVoice;
 }
 

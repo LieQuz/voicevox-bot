@@ -9,6 +9,8 @@
 - `/leave`: ボイスチャンネルから退出
 - `/autojoin`: ユーザー参加時のVC自動参加をサーバーごとにON/OFF（管理者向け）
 - `/autojoin-channel`: 自動参加時の読み上げ対象テキストチャンネルをサーバーごとに設定（管理者向け）
+- `/vc-notify`: サーバー内のVC参加/退出を埋め込み通知する機能をON/OFF（管理者向け）
+- `/vc-notify-channel`: VC参加/退出の埋め込み通知先テキストチャンネルを設定（管理者向け）
 - `/speaker`: プルダウンから自分の話者IDを変更（永続化）
 - `/dict`: サーバー用の読み替え辞書を管理（管理者向け）
 - `/speakers`: 話者一覧を見やすく表示
@@ -107,6 +109,10 @@ RATE_LIMIT_WINDOW_MS=10000
 VC自動参加を使う場合は、管理者が以下を設定します:
 - `/autojoin enabled:true` または `/autojoin enabled:false`
 - `/autojoin-channel channel:#読み上げ対象チャンネル`
+
+VC参加/退出の埋め込み通知を使う場合:
+- `/vc-notify enabled:true` または `/vc-notify enabled:false`
+- `/vc-notify-channel channel:#通知先チャンネル`
 
 設定保存先はユーザー話者・辞書と同じ `data/voicevox-bot.sqlite3` です。
 
