@@ -12,6 +12,7 @@
 - `/speaker`: プルダウンから自分の話者IDを変更（永続化）
 - `/dict`: サーバー用の読み替え辞書を管理（管理者向け）
 - `/speakers`: 話者一覧を見やすく表示
+- `/default-speaker`: サーバーの標準話者IDを設定（管理者向け、未設定ユーザー・自動参加時のフォールバック）
 - `/help`: コマンド一覧 + 主要話者一覧（先頭8件）を表示
 - `/join` を実行したテキストチャンネルの通常メッセージを読み上げ
 - 管理対象VCでユーザーの参加/退出時に「ユーザー名が参加しました / 退出しました」と読み上げ
@@ -87,6 +88,10 @@ VOICEVOX_BASE_URL=http://127.0.0.1:50021
 DEFAULT_SPEAKER=1
 DEFAULT_SPEED_SCALE=1.2
 SPEAKER_CACHE_TTL_MS=300000
+VOICEVOX_FETCH_TIMEOUT_MS=10000
+MAX_QUEUE_SIZE=50
+RATE_LIMIT_MAX=5
+RATE_LIMIT_WINDOW_MS=10000
 ```
 
 `/speaker` のプルダウン選択は「実行したユーザー自身」の設定を保存します。  

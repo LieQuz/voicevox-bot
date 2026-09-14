@@ -9,7 +9,8 @@ import {
   createAudioPlayer,
   createAudioResource,
   entersState,
-  joinVoiceChannel
+  joinVoiceChannel,
+  StreamType
 } from "@discordjs/voice";
 import {
   ActionRowBuilder,
@@ -23,14 +24,14 @@ import {
   PermissionFlagsBits,
   SlashCommandBuilder,
   StringSelectMenuBuilder,
+  Interaction,
   VoiceState,
   VoiceBasedChannel
 } from "discord.js";
 import nodeEmoji = require("node-emoji");
-import { randomUUID } from "node:crypto";
-import { mkdir, unlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 
 const token = process.env.DISCORD_TOKEN;
 const commandGuildId = process.env.DISCORD_GUILD_ID;
@@ -38,6 +39,10 @@ const voicevoxBaseUrl = process.env.VOICEVOX_BASE_URL ?? "http://127.0.0.1:50021
 const defaultSpeaker = Number.parseInt(process.env.DEFAULT_SPEAKER ?? "1", 10);
 const defaultSpeedScale = Number.parseFloat(process.env.DEFAULT_SPEED_SCALE ?? "1.2");
 const speakerCacheTtlMs = Number.parseInt(process.env.SPEAKER_CACHE_TTL_MS ?? "300000", 10);
+const voicevoxFetchTimeoutMs = Number.parseInt(process.env.VOICEVOX_FETCH_TIMEOUT_MS ?? "10000", 10);
+const maxQueueSize = Number.parseInt(process.env.MAX_QUEUE_SIZE ?? "50", 10);
+const rateLimitMaxMessages = Number.parseInt(process.env.RATE_LIMIT_MAX ?? "5", 10);
+const rateLimitWindowMs = Number.parseInt(process.env.RATE_LIMIT_WINDOW_MS ?? "10000", 10);
 
 if (!token) {
   throw new Error("DISCORD_TOKEN is not set.");
@@ -54,6 +59,43 @@ if (Number.isNaN(defaultSpeedScale) || defaultSpeedScale <= 0) {
 if (Number.isNaN(speakerCacheTtlMs) || speakerCacheTtlMs < 0) {
   throw new Error("SPEAKER_CACHE_TTL_MS must be zero or a positive number.");
 }
+
+if (Number.isNaN(voicevoxFetchTimeoutMs) || voicevoxFetchTimeoutMs <= 0) {
+  throw new Error("VOICEVOX_FETCH_TIMEOUT_MS must be a positive number.");
+}
+
+if (Number.isNaN(maxQueueSize) || maxQueueSize <= 0) {
+  throw new Error("MAX_QUEUE_SIZE must be a positive number.");
+}
+
+if (Number.isNaN(rateLimitMaxMessages) || rateLimitMaxMessages <= 0) {
+  throw new Error("RATE_LIMIT_MAX must be a positive number.");
+}
+
+if (Number.isNaN(rateLimitWindowMs) || rateLimitWindowMs <= 0) {
+  throw new Error("RATE_LIMIT_WINDOW_MS must be a positive number.");
+}
+
+const emojiJapaneseNames: Record<string, string> = {
+  "😀": "にっこり",
+  "😃": "笑顔",
+  "😄": "大笑い",
+  "😁": "にやにや",
+  "😂": "嬉し泣き",
+  "🤣": "大笑い",
+  "😊": "微笑み",
+  "😍": "ハート目",
+  "🥰": "愛",
+  "😘": "キス",
+  "👍": "いいね",
+  "👎": "よくない",
+  "🙏": "お願い",
+  "🎉": "お祝い",
+  "❤️": "ハート",
+  "💔": "失恋",
+  "🔥": "炎",
+  "✨": "キラキラ"
+};
 
 type VoicevoxAudioQuery = {
   speedScale: number;
@@ -92,7 +134,6 @@ type GuildState = {
   speaker: number;
   textChannelId?: string;
   voiceChannelId: string;
-  currentTempFile?: string;
 };
 
 const guildStates = new Map<string, GuildState>();
@@ -102,6 +143,9 @@ let cachedSpeakers: VoicevoxSpeaker[] | null = null;
 let speakersCachedAt = 0;
 let speakerFetchInFlight: Promise<VoicevoxSpeaker[]> | null = null;
 const pronunciationRuleCache = new Map<string, PronunciationRule[]>();
+const userRateLimitTimestamps = new Map<string, number[]>();
+const queueNotifyCooldownUntil = new Map<string, number>();
+let shuttingDown = false;
 const speakerSelectPageSize = 25;
 const speakerSelectIdPrefix = "speaker-select";
 const speakerSelectPageIdPrefix = "speaker-select-page";
@@ -153,7 +197,13 @@ const slashCommands = [
     )
     .addSubcommand((subcommand) => subcommand.setName("list").setDescription("読み替え辞書の一覧を表示")),
   new SlashCommandBuilder().setName("help").setDescription("使い方と主要話者一覧を表示します"),
-  new SlashCommandBuilder().setName("speakers").setDescription("話者一覧を表示します")
+  new SlashCommandBuilder().setName("speakers").setDescription("話者一覧を表示します"),
+  new SlashCommandBuilder()
+    .setName("default-speaker")
+    .setDescription("サーバーの標準話者IDを設定します（管理者向け）")
+    .addIntegerOption((option) =>
+      option.setName("speaker").setDescription("VOICEVOXの話者スタイルID").setRequired(true).setMinValue(0)
+    )
 ].map((command) => command.toJSON());
 
 client.once("ready", async () => {
@@ -174,37 +224,39 @@ client.once("ready", async () => {
 });
 
 client.on("messageCreate", async (message) => {
-  if (!message.guild || message.author.bot) {
-    return;
+  try {
+    if (!message.guild || message.author.bot) {
+      return;
+    }
+
+    const state = guildStates.get(message.guild.id);
+    if (!state || message.channel.id !== state.textChannelId) {
+      return;
+    }
+
+    if (message.content.trim().toLowerCase() === "s") {
+      state.queue.length = 0;
+      state.player.stop(true);
+      return;
+    }
+
+    const hasAttachments = message.attachments.size > 0;
+    const hasStickers = message.stickers.size > 0;
+    const text = await normalizeForSpeech(message.guild.id, message.content, message, hasAttachments, hasStickers);
+    if (!text) {
+      return;
+    }
+
+    const speaker = (await getUserSpeaker(message.guild.id, message.author.id)) ?? state.speaker;
+
+    await enqueueSpeech(message.guild.id, { text, speaker }, { userId: message.author.id });
+  } catch (error) {
+    console.error("messageCreate handler error:", error);
   }
-
-  const state = guildStates.get(message.guild.id);
-  if (!state || message.channel.id !== state.textChannelId) {
-    return;
-  }
-
-  if (message.content.trim().toLowerCase() === "s") {
-    state.queue.length = 0;
-    state.player.stop(true);
-    return;
-  }
-
-  const text = await normalizeForSpeech(message.guild.id, message.content, message, message.attachments.size > 0);
-  if (!text) {
-    return;
-  }
-
-  const speaker = (await getUserSpeaker(message.guild.id, message.author.id)) ?? state.speaker;
-
-  state.queue.push({
-    text,
-    speaker
-  });
-
-  await processQueue(message.guild.id);
 });
 
 client.on("interactionCreate", async (interaction) => {
+  try {
   if (interaction.isStringSelectMenu() && interaction.customId.startsWith(`${speakerSelectIdPrefix}:`)) {
     const parsed = parseSpeakerComponentId(interaction.customId, speakerSelectIdPrefix);
     if (!interaction.guild || !parsed) {
@@ -217,7 +269,7 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     const speaker = Number.parseInt(interaction.values[0] ?? "", 10);
-    if (Number.isNaN(speaker) || speaker <= 0) {
+    if (Number.isNaN(speaker) || speaker < 0) {
       await interaction.reply({ content: "話者IDの読み取りに失敗しました。", ephemeral: true });
       return;
     }
@@ -275,6 +327,22 @@ client.on("interactionCreate", async (interaction) => {
     const enabled = interaction.options.getBoolean("enabled", true);
     await setGuildAutoJoinEnabled(interaction.guild.id, enabled);
     await replyPrivate(interaction, `VC自動参加を${enabled ? "ON" : "OFF"}にしました。`);
+    return;
+  }
+
+  if (interaction.commandName === "default-speaker") {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      await replyPrivate(interaction, "このコマンドはサーバー管理者（サーバー管理権限）のみ実行できます。");
+      return;
+    }
+
+    const speaker = interaction.options.getInteger("speaker", true);
+    await setGuildDefaultSpeaker(interaction.guild.id, speaker);
+    const state = guildStates.get(interaction.guild.id);
+    if (state) {
+      state.speaker = speaker;
+    }
+    await replyPrivate(interaction, `サーバーの標準話者IDを ${speaker} に設定しました。`);
     return;
   }
 
@@ -384,6 +452,7 @@ client.on("interactionCreate", async (interaction) => {
       "- `/autojoin-channel` : 自動参加時の読み上げ対象を設定（管理者向け）",
       "- `/speaker` : プルダウンであなたの話者IDを保存",
       "- `/dict` : 読み替え辞書を管理（管理者向け）",
+      "- `/default-speaker` : サーバーの標準話者IDを設定（管理者向け）",
       "- `/speakers` : 話者一覧を見やすく表示",
       "",
       "操作の流れ:",
@@ -411,9 +480,14 @@ client.on("interactionCreate", async (interaction) => {
 
     await replyInChunks(interaction, "話者ID一覧（キャラクターごと）:", lines, true);
   }
+  } catch (error) {
+    console.error("Interaction handler error:", error);
+    await replyInteractionError(interaction, "処理中にエラーが発生しました。");
+  }
 });
 
 client.on("voiceStateUpdate", async (oldState, newState) => {
+  try {
   const guildId = newState.guild.id;
   const humanJoinedVoiceChannel =
     oldState.channelId !== newState.channelId &&
@@ -465,26 +539,31 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
     oldState.channelId !== state.voiceChannelId && newState.channelId === state.voiceChannelId;
   if (joinedManagedChannel && newState.member && !newState.member.user.bot) {
     const joinSpeaker = (await getUserSpeaker(guildId, newState.member.id)) ?? state.speaker;
-    state.queue.push({
-      text: `${newState.member.displayName}が参加しました`,
-      speaker: joinSpeaker
-    });
-    await processQueue(guildId);
+    const displayName = await normalizeDisplayNameForSpeech(guildId, newState.member.displayName);
+    await enqueueSpeech(
+      guildId,
+      { text: `${displayName}が参加しました`, speaker: joinSpeaker },
+      { skipRateLimit: true }
+    );
   }
 
   const leftManagedChannel = oldState.channelId === state.voiceChannelId && newState.channelId !== state.voiceChannelId;
   if (leftManagedChannel && oldState.member && !oldState.member.user.bot) {
     const leaveSpeaker = (await getUserSpeaker(guildId, oldState.member.id)) ?? state.speaker;
-    state.queue.push({
-      text: `${oldState.member.displayName}が退出しました`,
-      speaker: leaveSpeaker
-    });
-    await processQueue(guildId);
+    const displayName = await normalizeDisplayNameForSpeech(guildId, oldState.member.displayName);
+    await enqueueSpeech(
+      guildId,
+      { text: `${displayName}が退出しました`, speaker: leaveSpeaker },
+      { skipRateLimit: true }
+    );
   }
 
   const humanMemberCount = [...voiceChannel.members.values()].filter((member) => !member.user.bot).length;
   if (humanMemberCount === 0) {
     await disconnectGuild(guildId);
+  }
+  } catch (error) {
+    console.error("voiceStateUpdate handler error:", error);
   }
 });
 
@@ -511,12 +590,7 @@ async function joinCommand(interaction: ChatInputCommandInteraction): Promise<vo
     }
   }
 
-  const refreshedState = guildStates.get(interaction.guild!.id);
-  if (refreshedState) {
-    refreshedState.textChannelId = interaction.channelId;
-    await replyPrivate(interaction, "すでに接続中です。読み上げ対象テキストチャンネルを更新しました。");
-    return;
-  }
+  await interaction.deferReply({ ephemeral: true });
 
   const connection = joinVoiceChannel({
     channelId: voiceChannel.id,
@@ -524,17 +598,25 @@ async function joinCommand(interaction: ChatInputCommandInteraction): Promise<vo
     adapterCreator: voiceChannel.guild.voiceAdapterCreator
   });
 
-  await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+  } catch (error) {
+    connection.destroy();
+    console.error("Failed to join voice channel:", error);
+    await replyPrivate(interaction, "VCへの接続に失敗しました。しばらくしてから再度お試しください。");
+    return;
+  }
 
   const player = createAudioPlayer();
   connection.subscribe(player);
 
+  const guildSpeaker = await getGuildDefaultSpeaker(interaction.guild!.id);
   guildStates.set(interaction.guild!.id, {
     connection,
     player,
     queue: [],
     processing: false,
-    speaker: defaultSpeaker,
+    speaker: guildSpeaker,
     textChannelId: interaction.channelId,
     voiceChannelId: voiceChannel.id
   });
@@ -576,12 +658,13 @@ async function autoJoinVoiceChannel(
 
   const player = createAudioPlayer();
   connection.subscribe(player);
+  const guildSpeaker = await getGuildDefaultSpeaker(guildId);
   guildStates.set(guildId, {
     connection,
     player,
     queue: [],
     processing: false,
-    speaker: defaultSpeaker,
+    speaker: guildSpeaker,
     textChannelId,
     voiceChannelId: voiceChannel.id
   });
@@ -612,10 +695,7 @@ async function processQueue(guildId: string): Promise<void> {
 
   try {
     const wav = await synthesizeVoice(next.text, next.speaker);
-    const filePath = await saveTempWav(wav);
-    state.currentTempFile = filePath;
-
-    const resource = createAudioResource(filePath);
+    const resource = createAudioResource(Readable.from(wav), { inputType: StreamType.Arbitrary });
     state.player.play(resource);
     await entersState(state.player, AudioPlayerStatus.Playing, 10_000);
 
@@ -635,11 +715,15 @@ async function processQueue(guildId: string): Promise<void> {
   } catch (error) {
     console.error("Failed to process queue item:", error);
   } finally {
-    await cleanupTempFile(state.currentTempFile);
-    state.currentTempFile = undefined;
     state.processing = false;
-    await processQueue(guildId);
+    if (guildStates.has(guildId)) {
+      await processQueue(guildId);
+    }
   }
+}
+
+function voicevoxFetchSignal(): AbortSignal {
+  return AbortSignal.timeout(voicevoxFetchTimeoutMs);
 }
 
 async function synthesizeVoice(text: string, speaker: number): Promise<Buffer> {
@@ -649,7 +733,8 @@ async function synthesizeVoice(text: string, speaker: number): Promise<Buffer> {
   });
 
   const queryResponse = await fetch(`${voicevoxBaseUrl}/audio_query?${params.toString()}`, {
-    method: "POST"
+    method: "POST",
+    signal: voicevoxFetchSignal()
   });
 
   if (!queryResponse.ok) {
@@ -664,7 +749,8 @@ async function synthesizeVoice(text: string, speaker: number): Promise<Buffer> {
     headers: {
       "Content-Type": "application/json"
     },
-    body: JSON.stringify(audioQuery)
+    body: JSON.stringify(audioQuery),
+    signal: voicevoxFetchSignal()
   });
 
   if (!synthesisResponse.ok) {
@@ -684,7 +770,7 @@ async function fetchVoicevoxSpeakers(): Promise<VoicevoxSpeaker[]> {
 
   if (!speakerFetchInFlight) {
     speakerFetchInFlight = (async () => {
-      const response = await fetch(`${voicevoxBaseUrl}/speakers`);
+      const response = await fetch(`${voicevoxBaseUrl}/speakers`, { signal: voicevoxFetchSignal() });
       if (!response.ok) {
         throw new Error(`VOICEVOX speakers failed: ${response.status} ${response.statusText}`);
       }
@@ -897,9 +983,40 @@ async function initDatabase(): Promise<void> {
       guild_id TEXT NOT NULL PRIMARY KEY,
       autojoin_enabled INTEGER NOT NULL DEFAULT 0 CHECK (autojoin_enabled IN (0, 1)),
       autojoin_text_channel_id TEXT,
+      default_speaker INTEGER,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
   `);
+
+  try {
+    await db.exec(`ALTER TABLE guild_settings ADD COLUMN default_speaker INTEGER;`);
+  } catch {
+    // column already exists
+  }
+}
+
+async function setGuildDefaultSpeaker(guildId: string, speaker: number): Promise<void> {
+  await db.run(
+    `
+      INSERT INTO guild_settings (guild_id, default_speaker)
+      VALUES (?, ?)
+      ON CONFLICT(guild_id)
+      DO UPDATE SET default_speaker = excluded.default_speaker, updated_at = CURRENT_TIMESTAMP;
+    `,
+    guildId,
+    speaker
+  );
+}
+
+async function getGuildDefaultSpeaker(guildId: string): Promise<number> {
+  const row = await db.get<{ default_speaker: number | null }>(
+    "SELECT default_speaker FROM guild_settings WHERE guild_id = ?;",
+    guildId
+  );
+  if (row?.default_speaker !== null && row?.default_speaker !== undefined) {
+    return row.default_speaker;
+  }
+  return defaultSpeaker;
 }
 
 async function setGuildAutoJoinEnabled(guildId: string, enabled: boolean): Promise<void> {
@@ -1037,27 +1154,6 @@ function applyPronunciationRules(text: string, rules: PronunciationRule[]): stri
   return output;
 }
 
-async function saveTempWav(audio: Buffer): Promise<string> {
-  const tempDir = join(tmpdir(), "voicevox-bot");
-  await mkdir(tempDir, { recursive: true });
-
-  const filePath = join(tempDir, `${randomUUID()}.wav`);
-  await writeFile(filePath, audio);
-  return filePath;
-}
-
-async function cleanupTempFile(filePath?: string): Promise<void> {
-  if (!filePath) {
-    return;
-  }
-
-  try {
-    await unlink(filePath);
-  } catch (error) {
-    console.error(`Failed to remove temp file ${filePath}:`, error);
-  }
-}
-
 async function disconnectGuild(guildId: string): Promise<void> {
   await disconnectGuildInternal(guildId, true);
 }
@@ -1069,20 +1165,119 @@ async function disconnectGuildInternal(guildId: string, destroyConnection: boole
   }
 
   state.queue.length = 0;
+  state.processing = false;
+  state.player.stop(true);
   if (destroyConnection && state.connection.state.status !== VoiceConnectionStatus.Destroyed) {
     state.connection.destroy();
   }
   guildStates.delete(guildId);
-  await cleanupTempFile(state.currentTempFile);
+}
+
+function rateLimitKey(guildId: string, userId: string): string {
+  return `${guildId}:${userId}`;
+}
+
+function isWithinRateLimit(guildId: string, userId: string): boolean {
+  const key = rateLimitKey(guildId, userId);
+  const now = Date.now();
+  const timestamps = userRateLimitTimestamps.get(key) ?? [];
+  const recent = timestamps.filter((timestamp) => now - timestamp < rateLimitWindowMs);
+  userRateLimitTimestamps.set(key, recent);
+  return recent.length < rateLimitMaxMessages;
+}
+
+function recordRateLimit(guildId: string, userId: string): void {
+  const key = rateLimitKey(guildId, userId);
+  const timestamps = userRateLimitTimestamps.get(key) ?? [];
+  timestamps.push(Date.now());
+  userRateLimitTimestamps.set(key, timestamps);
+}
+
+async function notifyTextChannelThrottled(
+  guildId: string,
+  textChannelId: string | undefined,
+  content: string
+): Promise<void> {
+  const now = Date.now();
+  const cooldownKey = `${guildId}:${content}`;
+  const cooldownUntil = queueNotifyCooldownUntil.get(cooldownKey) ?? 0;
+  if (now < cooldownUntil) {
+    return;
+  }
+
+  queueNotifyCooldownUntil.set(cooldownKey, now + rateLimitWindowMs);
+  await notifyTextChannel(textChannelId, content);
+}
+
+async function enqueueSpeech(
+  guildId: string,
+  item: QueueItem,
+  options: { userId?: string; skipRateLimit?: boolean } = {}
+): Promise<void> {
+  const state = guildStates.get(guildId);
+  if (!state) {
+    return;
+  }
+
+  if (!options.skipRateLimit && options.userId) {
+    if (!isWithinRateLimit(guildId, options.userId)) {
+      await notifyTextChannelThrottled(
+        guildId,
+        state.textChannelId,
+        "読み上げが多すぎるため、しばらくスキップします。"
+      );
+      return;
+    }
+    recordRateLimit(guildId, options.userId);
+  }
+
+  if (state.queue.length >= maxQueueSize) {
+    await notifyTextChannelThrottled(
+      guildId,
+      state.textChannelId,
+      `読み上げキューが上限（${maxQueueSize}件）に達したため、メッセージを破棄しました。`
+    );
+    return;
+  }
+
+  state.queue.push(item);
+  await processQueue(guildId);
 }
 
 async function replyPrivate(interaction: ChatInputCommandInteraction, content: string): Promise<void> {
-  if (interaction.deferred || interaction.replied) {
+  if (interaction.deferred && !interaction.replied) {
+    await interaction.editReply({ content });
+    return;
+  }
+
+  if (interaction.replied) {
     await interaction.followUp({ content, ephemeral: true });
     return;
   }
 
   await interaction.reply({ content, ephemeral: true });
+}
+
+async function replyInteractionError(interaction: Interaction, content: string): Promise<void> {
+  if (!interaction.isRepliable()) {
+    return;
+  }
+
+  try {
+    if (interaction.deferred && !interaction.replied) {
+      await interaction.editReply({ content });
+      return;
+    }
+
+    if (!interaction.replied) {
+      await interaction.reply({ content, ephemeral: true });
+      return;
+    }
+
+    await interaction.followUp({ content, ephemeral: true });
+  } catch (replyError) {
+    console.error("Failed to send interaction error response:", replyError);
+  }
 }
 
 async function notifyTextChannel(textChannelId: string | undefined, content: string): Promise<void> {
@@ -1095,18 +1290,73 @@ async function notifyTextChannel(textChannelId: string | undefined, content: str
   }
 }
 
+type SpeechMessageContext = {
+  mentions: { members: { get(id: string): { displayName: string } | undefined } | null };
+  guild: { channels: { cache: { get(id: string): { name: string } | undefined } } } | null;
+};
+
+function replaceUnicodeEmojiWithJapanese(text: string): string {
+  let output = text;
+  for (const [emoji, name] of Object.entries(emojiJapaneseNames)) {
+    if (output.includes(emoji)) {
+      output = output.split(emoji).join(` ${name} `);
+    }
+  }
+  return output;
+}
+
+function applyLaughNormalization(text: string): string {
+  return text
+    .replace(/[wｗ]{2,}/g, " わらわら ")
+    .replace(/(?<=[ぁ-んァ-ヶ一-龯ー])[wｗ](?=$|[\s!！?？。、「」、,.])/g, "わら")
+    .replace(/(^|[\s!！?？。、「」、,.()（）])([wｗ])(?=$|[\s!！?？。、「」、,.()（）])/g, "$1わら");
+}
+
+async function applyEmojiAndDictionaryTransform(guildId: string, text: string): Promise<string> {
+  const pronunciationRules = await getPronunciationRules(guildId);
+  const replacedByDictionary = applyPronunciationRules(text, pronunciationRules);
+  const withJapaneseEmoji = replaceUnicodeEmojiWithJapanese(replacedByDictionary);
+  const customEmojiNamed = withJapaneseEmoji.replace(/<a?:([a-zA-Z0-9_]+):\d+>/g, " $1 ");
+  const unicodeEmojiNamed = nodeEmoji.unemojify(customEmojiNamed);
+  const shortcodeNamed = unicodeEmojiNamed.replace(/:([a-zA-Z0-9_+-]+):/g, " $1 ");
+  return applyLaughNormalization(shortcodeNamed).replace(/\s+/g, " ").trim();
+}
+
+async function normalizeDisplayNameForSpeech(guildId: string, displayName: string): Promise<string> {
+  const transformed = await applyEmojiAndDictionaryTransform(guildId, displayName.trim());
+  return transformed.slice(0, 120);
+}
+
 async function normalizeForSpeech(
   guildId: string,
   content: string,
-  message: { mentions: { members: { get(id: string): { displayName: string } | undefined } | null } },
-  hasAttachments: boolean
+  message: SpeechMessageContext,
+  hasAttachments: boolean,
+  hasStickers: boolean
 ): Promise<string> {
   const trimmed = content.trim();
-  if (!trimmed && !hasAttachments) {
+  if (!trimmed && !hasAttachments && !hasStickers) {
     return "";
   }
 
-  const withDisplayNames = trimmed.replace(/<@!?(\d+)>/g, (_match, userId: string) => {
+  if (!trimmed && hasStickers) {
+    return "スタンプが投稿されました";
+  }
+
+  if (/^```[\s\S]*```$/.test(trimmed)) {
+    return "コードブロックが投稿されました";
+  }
+
+  let working = trimmed.replace(/```[\s\S]*?```/g, " コードブロック ");
+  working = working.replace(/\|\|([\s\S]+?)\|\|/g, " ネタバレを含むメッセージ ");
+  working = working.replace(/<#(\d+)>/g, (_match, channelId: string) => {
+    const channel = message.guild?.channels.cache.get(channelId);
+    return channel ? channel.name : "チャンネル";
+  });
+  working = working.replace(/<@&(\d+)>/g, " ロール ");
+  working = working.replace(/<t:(\d+)(?::[tTdDfFR])?>/g, " タイムスタンプ ");
+
+  const withDisplayNames = working.replace(/<@!?(\d+)>/g, (_match, userId: string) => {
     const member = message.mentions.members?.get(userId);
     return member ? member.displayName : "ユーザー";
   });
@@ -1117,19 +1367,14 @@ async function normalizeForSpeech(
       ? `${withLeadingAtRead} メディアが投稿されました`
       : hasAttachments
         ? "メディアが投稿されました"
-        : withLeadingAtRead;
-  const pronunciationRules = await getPronunciationRules(guildId);
-  const replacedByDictionary = applyPronunciationRules(withMediaNotice, pronunciationRules);
+        : hasStickers && withLeadingAtRead.length > 0
+          ? `${withLeadingAtRead} スタンプが投稿されました`
+          : hasStickers
+            ? "スタンプが投稿されました"
+            : withLeadingAtRead;
 
-  const withoutUrls = replacedByDictionary.replace(/https?:\/\/\S+/g, "URL");
-  const customEmojiNamed = withoutUrls.replace(/<a?:([a-zA-Z0-9_]+):\d+>/g, " $1 ");
-  const unicodeEmojiNamed = nodeEmoji.unemojify(customEmojiNamed);
-  const shortcodeNamed = unicodeEmojiNamed.replace(/:([a-zA-Z0-9_+-]+):/g, " $1 ");
-  const laughNormalized = shortcodeNamed
-    .replace(/[wｗ]{2,}/g, " わらわら ")
-    .replace(/(?<=[ぁ-んァ-ヶ一-龯ー])[wｗ](?=$|[\s!！?？。、「」、,.])/g, "わら")
-    .replace(/(^|[\s!！?？。、「」、,.()（）])([wｗ])(?=$|[\s!！?？。、「」、,.()（）])/g, "$1わら");
-  const normalizedSpaces = laughNormalized.replace(/\s+/g, " ").trim();
+  const withoutUrls = withMediaNotice.replace(/https?:\/\/\S+/g, "URL");
+  const normalizedSpaces = await applyEmojiAndDictionaryTransform(guildId, withoutUrls);
   return normalizedSpaces.slice(0, 120);
 }
 
@@ -1137,7 +1382,30 @@ function isJoinableVoiceChannel(channel: VoiceBasedChannel): boolean {
   return channel.type === ChannelType.GuildVoice || channel.type === ChannelType.GuildStageVoice;
 }
 
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  console.log(`Received ${signal}, shutting down gracefully...`);
+
+  for (const guildId of [...guildStates.keys()]) {
+    await disconnectGuildInternal(guildId, true);
+  }
+
+  client.destroy();
+  await db.close();
+  process.exit(0);
+}
+
 async function main(): Promise<void> {
+  process.on("SIGTERM", () => {
+    void shutdown("SIGTERM");
+  });
+  process.on("SIGINT", () => {
+    void shutdown("SIGINT");
+  });
+
   await initDatabase();
   await client.login(token);
 }
