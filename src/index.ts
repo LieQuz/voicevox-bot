@@ -1286,7 +1286,7 @@ async function applyEmojiAndDictionaryTransform(guildId: string, text: string): 
   const pronunciationRules = await getPronunciationRules(guildId);
   const replacedByDictionary = applyPronunciationRules(text, pronunciationRules);
   const withJapaneseEmoji = replaceUnicodeEmojiWithJapanese(replacedByDictionary);
-  const customEmojiNamed = withJapaneseEmoji.replace(/<a?:([a-zA-Z0-9_]+):\d+>/g, " $1 ");
+  const customEmojiNamed = withJapaneseEmoji.replace(/<a?:([a-zA-Z0-9_]+):\d+>/g, " カスタム絵文字 ");
   const unicodeEmojiNamed = nodeEmoji.unemojify(customEmojiNamed);
   const shortcodeNamed = unicodeEmojiNamed.replace(/:([a-zA-Z0-9_+-]+):/g, " $1 ");
   const withFallbackEmoji = replaceUnknownEmojiWithFallback(shortcodeNamed);
