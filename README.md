@@ -95,6 +95,9 @@ DISCORD_GUILD_ID=あなたのサーバーID # 任意: 指定時はスラッシ�
 VOICEVOX_BASE_URL=http://127.0.0.1:50021
 DEFAULT_SPEAKER=1
 DEFAULT_SPEED_SCALE=1.2
+VOICEVOX_INTONATION_SCALE=1.0
+VOICEVOX_PITCH_SCALE=0
+VOICEVOX_PAUSE_LENGTH_SCALE=1.0
 SPEAKER_CACHE_TTL_MS=300000
 VOICEVOX_FETCH_TIMEOUT_MS=10000
 VOICEVOX_PREWARM_LIMIT=4
@@ -109,6 +112,23 @@ RATE_LIMIT_WINDOW_MS=10000
 ストリーミング再生が利用できない古い VOICEVOX Engine では自動で一括合成にフォールバックします。
 
 `VOICEVOX_PREWARM_LIMIT` は起動時に先読みする話者数です。GPUのVRAMやメモリが少ない環境では `1〜2` に下げてください（`0` で無効）。
+
+### 声を自然にしたい場合
+
+```dotenv
+DEFAULT_SPEED_SCALE=1.1
+VOICEVOX_INTONATION_SCALE=1.15
+VOICEVOX_PITCH_SCALE=0
+VOICEVOX_PAUSE_LENGTH_SCALE=0.95
+```
+
+- `DEFAULT_SPEED_SCALE`: `1.2` は速め。自然さ重視なら `1.0〜1.1`
+- `VOICEVOX_INTONATION_SCALE`: `1.1〜1.2` で抑揚が豊かになる（上げすぎると大げさ）
+- `VOICEVOX_PITCH_SCALE`: 話者ごとに `-0.03〜+0.03` 程度で微調整
+- `VOICEVOX_PAUSE_LENGTH_SCALE`: `0.9〜1.0` で読点の間を調整
+- `/speaker` で話者・スタイルを変えるだけでも印象が大きく変わります
+
+ナレーション向けの別音声 **VOICEVOX NEMO** を試す方法は [DOKPLOY.md](DOKPLOY.md#より自然な声を試すvoicevox-nemo) を参照してください。
 
 `/speaker` のプルダウン選択は「実行したユーザー自身」の設定を保存します。  
 保存先DB: `data/voicevox-bot.sqlite3`

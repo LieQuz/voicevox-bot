@@ -43,6 +43,9 @@ const commandGuildId = process.env.DISCORD_GUILD_ID;
 const voicevoxBaseUrl = process.env.VOICEVOX_BASE_URL ?? "http://127.0.0.1:50021";
 const defaultSpeaker = Number.parseInt(process.env.DEFAULT_SPEAKER ?? "1", 10);
 const defaultSpeedScale = Number.parseFloat(process.env.DEFAULT_SPEED_SCALE ?? "1.2");
+const defaultIntonationScale = Number.parseFloat(process.env.VOICEVOX_INTONATION_SCALE ?? "1.0");
+const defaultPitchScale = Number.parseFloat(process.env.VOICEVOX_PITCH_SCALE ?? "0");
+const defaultPauseLengthScale = Number.parseFloat(process.env.VOICEVOX_PAUSE_LENGTH_SCALE ?? "1.0");
 const speakerCacheTtlMs = Number.parseInt(process.env.SPEAKER_CACHE_TTL_MS ?? "300000", 10);
 const voicevoxFetchTimeoutMs = Number.parseInt(process.env.VOICEVOX_FETCH_TIMEOUT_MS ?? "10000", 10);
 const voicevoxPrewarmLimit = Number.parseInt(process.env.VOICEVOX_PREWARM_LIMIT ?? "4", 10);
@@ -65,6 +68,18 @@ if (Number.isNaN(defaultSpeaker)) {
 
 if (Number.isNaN(defaultSpeedScale) || defaultSpeedScale <= 0) {
   throw new Error("DEFAULT_SPEED_SCALE must be a positive number.");
+}
+
+if (Number.isNaN(defaultIntonationScale) || defaultIntonationScale < 0) {
+  throw new Error("VOICEVOX_INTONATION_SCALE must be zero or a positive number.");
+}
+
+if (Number.isNaN(defaultPitchScale)) {
+  throw new Error("VOICEVOX_PITCH_SCALE must be a number.");
+}
+
+if (Number.isNaN(defaultPauseLengthScale) || defaultPauseLengthScale <= 0) {
+  throw new Error("VOICEVOX_PAUSE_LENGTH_SCALE must be a positive number.");
 }
 
 if (Number.isNaN(speakerCacheTtlMs) || speakerCacheTtlMs < 0) {
@@ -93,6 +108,9 @@ if (Number.isNaN(rateLimitWindowMs) || rateLimitWindowMs <= 0) {
 
 type VoicevoxAudioQuery = {
   speedScale: number;
+  intonationScale: number;
+  pitchScale: number;
+  pauseLengthScale: number;
   outputSamplingRate: number;
   outputStereo: boolean;
   [key: string]: unknown;
@@ -1027,6 +1045,9 @@ async function fetchAudioQuery(
 
   const audioQuery = (await response.json()) as VoicevoxAudioQuery;
   audioQuery.speedScale = defaultSpeedScale;
+  audioQuery.intonationScale = defaultIntonationScale;
+  audioQuery.pitchScale = defaultPitchScale;
+  audioQuery.pauseLengthScale = defaultPauseLengthScale;
   // 48kHz stereo PCM は ffmpeg を介さず直接 @discordjs/voice に渡せる。
   audioQuery.outputSamplingRate = 48_000;
   audioQuery.outputStereo = true;

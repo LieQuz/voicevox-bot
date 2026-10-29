@@ -71,11 +71,17 @@ DISCORD_TOKEN=あなたのBotトークン
 DISCORD_GUILD_ID=
 DEFAULT_SPEAKER=1
 DEFAULT_SPEED_SCALE=1.2
+VOICEVOX_INTONATION_SCALE=1.0
+VOICEVOX_PITCH_SCALE=0
+VOICEVOX_PAUSE_LENGTH_SCALE=1.0
 VOICEVOX_PREWARM_LIMIT=2
 VOICEVOX_STREAMING_SYNTHESIS=true
 ```
 
 - `DISCORD_GUILD_ID`: 指定するとスラッシュコマンドが即時反映されます
+- `VOICEVOX_INTONATION_SCALE`: `1.1〜1.2` で抑揚を豊かにできます
+- `DEFAULT_SPEED_SCALE`: 自然さ重視なら `1.0〜1.1`
+- `VOICEVOX_PAUSE_LENGTH_SCALE`: 読点の間の長さ（`0.9〜1.0`）
 - `VOICEVOX_PREWARM_LIMIT`: 起動時に先読みする話者数
   - VRAM 8GB: `2` 前後を推奨
   - VRAM 12GB以上: `4` 前後
@@ -137,7 +143,36 @@ docker run --rm \
 - VOICEVOX を更新したい場合はイメージタグを変更して再デプロイ
 - 本番では `nvidia-latest` より `nvidia-0.xx.x` のように**バージョン固定**を推奨
 
-## 6. 注意点
+## 6. より自然な声を試す（VOICEVOX NEMO）
+
+現行の VOICEVOX 音声よりナレーション寄りで自然に感じる場合がある、公式の別音声ライブラリ
+**VOICEVOX NEMO** も API 互換で利用できます。
+
+- イメージ: `voicevox/voicevox_nemo_engine:nvidia-latest`
+- エンジン 0.26.0 ベース（`/streaming_synthesis` 対応）
+- 女声1〜6 / 男声1〜3 の9声（キャラクター声ではありません）
+- 利用時は NEMO の規約・クレジット表記を確認してください
+
+試す場合は、`docker-compose.yml` の `voicevox` サービスだけを次のように変更します。
+
+```yaml
+  voicevox:
+    image: voicevox/voicevox_nemo_engine:nvidia-latest
+    restart: unless-stopped
+    environment:
+      VV_PORT: "50021"          # NEMOのデフォルトは50121
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+```
+
+`VOICEVOX_BASE_URL` は `http://voicevox:50021` のままで動きます。
+再デプロイ後、`/speaker` の一覧に NEMO の声が表示されます。
+
+元のキャラクター音声に戻す場合は、イメージを
+`voicevox/voicevox_engine:nvidia-latest` に戻して再デプロイしてください。
+
+> `nvidia-0.27.0-dev` などの開発版は新機能を含みますが、本番運用にはおすすめしません。
+
+## 7. 注意点
 
 - **Bot は1レプリカのみ**で運用してください（SQLite と Discord セッションの都合）
 - VOICEVOX GPU 版は VRAM を多く使います。`CUDA out of memory` が出る場合は
@@ -148,7 +183,7 @@ docker run --rm \
 - Bot の再起動時は `SIGTERM` を受けて DB を閉じ、VC から退出します
   （`stop_grace_period: 30s` 設定済み）
 
-## 7. トラブルシューティング
+## 8. トラブルシューティング
 
 ### `could not select device driver "" with capabilities: [[gpu]]`
 
