@@ -57,6 +57,7 @@ const rateLimitWindowMs = Number.parseInt(process.env.RATE_LIMIT_WINDOW_MS ?? "1
 const streamingSynthesisEnabled = !["false", "0", "no", "off"].includes(
   (process.env.VOICEVOX_STREAMING_SYNTHESIS ?? "true").trim().toLowerCase()
 );
+const ttsDebug = ["1", "true", "yes", "on"].includes((process.env.TTS_DEBUG ?? "").toLowerCase());
 
 if (!token) {
   throw new Error("DISCORD_TOKEN is not set.");
@@ -257,7 +258,8 @@ const slashCommands = [
 ].map((command) => command.toJSON());
 
 client.once("ready", async () => {
-  console.log(`Logged in as ${client.user?.tag}`);
+  console.log(`Logged in as ${client.user?.tag} (PID ${process.pid})`);
+  console.log("Read-aloud limit: 80 chars, omission suffix: 以下略...");
   client.user?.setActivity("/help | /join | /speaker | /dict | /autojoin", {
     type: ActivityType.Listening
   });
@@ -2105,7 +2107,13 @@ function truncateForSpeech(text: string): string {
   const visibleLength = Math.max(0, speechTextLimit - reservedLength);
   const truncated = characters.slice(0, visibleLength).join("").trimEnd();
   const separator = trailingPausePattern.test(truncated) ? "" : speechOmissionSeparator;
-  return `${truncated}${separator}${speechOmissionSuffix}`;
+  const result = `${truncated}${separator}${speechOmissionSuffix}`;
+  if (ttsDebug) {
+    console.log(
+      `[TTS] truncated ${characters.length} -> ${Array.from(result).length} chars: ...${result.slice(-20)}`
+    );
+  }
+  return result;
 }
 
 async function normalizeDisplayNameForSpeech(guildId: string, displayName: string): Promise<string> {

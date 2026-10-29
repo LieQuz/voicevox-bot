@@ -48,6 +48,7 @@ services:
       MAX_QUEUE_SIZE: ${MAX_QUEUE_SIZE:-50}
       RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-5}
       RATE_LIMIT_WINDOW_MS: ${RATE_LIMIT_WINDOW_MS:-10000}
+      TTS_DEBUG: ${TTS_DEBUG:-false}
       TZ: ${TZ:-Asia/Tokyo}
     volumes:
       - bot_data:/app/data
