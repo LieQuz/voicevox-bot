@@ -1,0 +1,53 @@
+services:
+  voicevox:
+    image: voicevox/voicevox_engine:nvidia-latest
+    restart: unless-stopped
+    # Bot と同じ Compose ネットワーク内だけで公開する（ports は指定しない）
+    expose:
+      - "50021"
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      # 追加パッケージ不要のTCPチェック
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/50021'"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    depends_on:
+      voicevox:
+        condition: service_healthy
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN:?DISCORD_TOKEN is required}
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
+      VOICEVOX_BASE_URL: http://voicevox:50021
+      DEFAULT_SPEAKER: ${DEFAULT_SPEAKER:-1}
+      DEFAULT_SPEED_SCALE: ${DEFAULT_SPEED_SCALE:-1.2}
+      SPEAKER_CACHE_TTL_MS: ${SPEAKER_CACHE_TTL_MS:-300000}
+      VOICEVOX_FETCH_TIMEOUT_MS: ${VOICEVOX_FETCH_TIMEOUT_MS:-10000}
+      VOICEVOX_PREWARM_LIMIT: ${VOICEVOX_PREWARM_LIMIT:-4}
+      VOICEVOX_STREAMING_SYNTHESIS: ${VOICEVOX_STREAMING_SYNTHESIS:-true}
+      MAX_QUEUE_SIZE: ${MAX_QUEUE_SIZE:-50}
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-5}
+      RATE_LIMIT_WINDOW_MS: ${RATE_LIMIT_WINDOW_MS:-10000}
+      TZ: ${TZ:-Asia/Tokyo}
+    volumes:
+      - bot_data:/app/data
+
+volumes:
+  bot_data:

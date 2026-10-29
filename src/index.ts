@@ -45,6 +45,7 @@ const defaultSpeaker = Number.parseInt(process.env.DEFAULT_SPEAKER ?? "1", 10);
 const defaultSpeedScale = Number.parseFloat(process.env.DEFAULT_SPEED_SCALE ?? "1.2");
 const speakerCacheTtlMs = Number.parseInt(process.env.SPEAKER_CACHE_TTL_MS ?? "300000", 10);
 const voicevoxFetchTimeoutMs = Number.parseInt(process.env.VOICEVOX_FETCH_TIMEOUT_MS ?? "10000", 10);
+const voicevoxPrewarmLimit = Number.parseInt(process.env.VOICEVOX_PREWARM_LIMIT ?? "4", 10);
 const maxQueueSize = Number.parseInt(process.env.MAX_QUEUE_SIZE ?? "50", 10);
 const rateLimitMaxMessages = Number.parseInt(process.env.RATE_LIMIT_MAX ?? "5", 10);
 const rateLimitWindowMs = Number.parseInt(process.env.RATE_LIMIT_WINDOW_MS ?? "10000", 10);
@@ -70,6 +71,10 @@ if (Number.isNaN(speakerCacheTtlMs) || speakerCacheTtlMs < 0) {
 
 if (Number.isNaN(voicevoxFetchTimeoutMs) || voicevoxFetchTimeoutMs <= 0) {
   throw new Error("VOICEVOX_FETCH_TIMEOUT_MS must be a positive number.");
+}
+
+if (Number.isNaN(voicevoxPrewarmLimit) || voicevoxPrewarmLimit < 0) {
+  throw new Error("VOICEVOX_PREWARM_LIMIT must be zero or a positive number.");
 }
 
 if (Number.isNaN(maxQueueSize) || maxQueueSize <= 0) {
@@ -1272,6 +1277,10 @@ async function initializeSpeaker(speaker: number): Promise<void> {
 }
 
 async function prewarmStoredSpeakers(): Promise<void> {
+  if (voicevoxPrewarmLimit <= 0) {
+    return;
+  }
+
   const speakers = new Set<number>([defaultSpeaker]);
 
   try {
@@ -1299,7 +1308,7 @@ async function prewarmStoredSpeakers(): Promise<void> {
     console.error("Failed to load stored speakers for pre-warming:", error);
   }
 
-  for (const speaker of [...speakers].slice(0, 8)) {
+  for (const speaker of [...speakers].slice(0, voicevoxPrewarmLimit)) {
     try {
       await initializeSpeaker(speaker);
     } catch (error) {

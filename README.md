@@ -96,6 +96,7 @@ DEFAULT_SPEAKER=1
 DEFAULT_SPEED_SCALE=1.2
 SPEAKER_CACHE_TTL_MS=300000
 VOICEVOX_FETCH_TIMEOUT_MS=10000
+VOICEVOX_PREWARM_LIMIT=4
 VOICEVOX_STREAMING_SYNTHESIS=true
 MAX_QUEUE_SIZE=50
 RATE_LIMIT_MAX=5
@@ -105,6 +106,8 @@ RATE_LIMIT_WINDOW_MS=10000
 `VOICEVOX_STREAMING_SYNTHESIS=false` にすると、従来の一括合成（`/synthesis`）に戻せます。
 
 ストリーミング再生が利用できない古い VOICEVOX Engine では自動で一括合成にフォールバックします。
+
+`VOICEVOX_PREWARM_LIMIT` は起動時に先読みする話者数です。GPUのVRAMやメモリが少ない環境では `1〜2` に下げてください（`0` で無効）。
 
 `/speaker` のプルダウン選択は「実行したユーザー自身」の設定を保存します。  
 保存先DB: `data/voicevox-bot.sqlite3`
@@ -124,6 +127,12 @@ VC参加/退出の埋め込み通知を使う場合:
 - `/vc-notify-channel channel:#通知先チャンネル`
 
 設定保存先はユーザー話者・辞書と同じ `data/voicevox-bot.sqlite3` です。
+
+## Dokploy（GPU版 VOICEVOX）
+
+Dokploy で Bot と VOICEVOX GPU 版をまとめて運用する手順は [DOKPLOY.md](DOKPLOY.md) を参照してください。
+
+`Dockerfile` / `docker-compose.yml` / `.dockerignore` を同梱しています。
 
 ## VOICEVOX Engine 起動（Docker）
 
