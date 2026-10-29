@@ -46,6 +46,8 @@ const defaultSpeedScale = Number.parseFloat(process.env.DEFAULT_SPEED_SCALE ?? "
 const speakerCacheTtlMs = Number.parseInt(process.env.SPEAKER_CACHE_TTL_MS ?? "300000", 10);
 const voicevoxFetchTimeoutMs = Number.parseInt(process.env.VOICEVOX_FETCH_TIMEOUT_MS ?? "10000", 10);
 const voicevoxPrewarmLimit = Number.parseInt(process.env.VOICEVOX_PREWARM_LIMIT ?? "4", 10);
+const voicevoxStreamingIdleTimeoutMs = Math.max(voicevoxFetchTimeoutMs, 120_000);
+const speechSilencePaddingFrames = 10;
 const maxQueueSize = Number.parseInt(process.env.MAX_QUEUE_SIZE ?? "50", 10);
 const rateLimitMaxMessages = Number.parseInt(process.env.RATE_LIMIT_MAX ?? "5", 10);
 const rateLimitWindowMs = Number.parseInt(process.env.RATE_LIMIT_WINDOW_MS ?? "10000", 10);
@@ -1040,28 +1042,63 @@ async function prepareStreamingSpeech(
   speaker: number,
   signal: AbortSignal
 ): Promise<SpeechAudio> {
-  const response = await fetch(`${voicevoxBaseUrl}/streaming_synthesis?speaker=${speaker}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(audioQuery),
-    signal: voicevoxStreamingSignal(signal)
-  });
+  const abortController = new AbortController();
+  let idleTimer: NodeJS.Timeout | undefined;
+  let idleTimedOut = false;
+
+  const clearIdleTimer = () => {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = undefined;
+    }
+  };
+
+  const resetIdleTimer = () => {
+    clearIdleTimer();
+    idleTimer = setTimeout(() => {
+      idleTimedOut = true;
+      console.error(
+        `VOICEVOX streaming_synthesis made no progress for ${voicevoxStreamingIdleTimeoutMs}ms; aborting.`
+      );
+      abortController.abort(new Error("VOICEVOX streaming_synthesis idle timeout"));
+    }, voicevoxStreamingIdleTimeoutMs);
+  };
+
+  resetIdleTimer();
+
+  let response: Response;
+  try {
+    response = await fetch(`${voicevoxBaseUrl}/streaming_synthesis?speaker=${speaker}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(audioQuery),
+      signal: combineAbortSignals([signal, abortController.signal])
+    });
+  } catch (error) {
+    clearIdleTimer();
+    throw error;
+  }
 
   if (response.status === 404 || response.status === 405) {
+    clearIdleTimer();
     throw new StreamingSynthesisUnsupportedError(
       `VOICEVOX streaming_synthesis returned ${response.status} ${response.statusText}`
     );
   }
 
   if (!response.ok) {
+    clearIdleTimer();
     throw new Error(`VOICEVOX streaming_synthesis failed: ${response.status} ${response.statusText}`);
   }
 
   if (!response.body) {
+    clearIdleTimer();
     throw new Error("VOICEVOX streaming_synthesis returned an empty response body.");
   }
+
+  resetIdleTimer();
 
   const bodyStream = Readable.fromWeb(
     response.body as unknown as import("node:stream/web").ReadableStream
@@ -1077,6 +1114,8 @@ async function prepareStreamingSpeech(
 
   const pcmStream = new Transform({
     transform(chunk, _encoding, callback) {
+      resetIdleTimer();
+
       if (headerParsed) {
         callback(null, chunk);
         return;
@@ -1121,34 +1160,43 @@ async function prepareStreamingSpeech(
       }
     },
     flush(callback) {
+      clearIdleTimer();
       markSynthesized();
       callback();
     }
   });
 
   pcmStream.once("error", () => {
-    if (!disposed) {
+    clearIdleTimer();
+    if (!disposed && !idleTimedOut) {
       console.error("VOICEVOX streaming_synthesis stream failed.");
     }
     markSynthesized();
   });
   pcmStream.once("close", () => {
+    clearIdleTimer();
     markSynthesized();
   });
 
   bodyStream.once("error", (error) => {
+    clearIdleTimer();
     pcmStream.destroy(error);
   });
   bodyStream.pipe(pcmStream);
 
   return {
-    resource: createAudioResource(pcmStream, { inputType: StreamType.Raw }),
+    resource: createAudioResource(pcmStream, {
+      inputType: StreamType.Raw,
+      silencePaddingFrames: speechSilencePaddingFrames
+    }),
     synthesized,
     dispose: () => {
       if (disposed) {
         return;
       }
       disposed = true;
+      clearIdleTimer();
+      abortController.abort();
       bodyStream.destroy();
       pcmStream.destroy();
     }
@@ -1181,8 +1229,14 @@ async function prepareBufferedSpeech(
 
   return {
     resource: isRawPcm
-      ? createAudioResource(stream, { inputType: StreamType.Raw })
-      : createAudioResource(stream, { inputType: StreamType.Arbitrary }),
+      ? createAudioResource(stream, {
+          inputType: StreamType.Raw,
+          silencePaddingFrames: speechSilencePaddingFrames
+        })
+      : createAudioResource(stream, {
+          inputType: StreamType.Arbitrary,
+          silencePaddingFrames: speechSilencePaddingFrames
+        }),
     synthesized: Promise.resolve(),
     dispose: () => {
       if (disposed) {
@@ -1250,12 +1304,6 @@ function combineAbortSignals(signals: AbortSignal[]): AbortSignal {
 function voicevoxFetchSignal(extraSignal?: AbortSignal): AbortSignal {
   const timeoutSignal = AbortSignal.timeout(voicevoxFetchTimeoutMs);
   return extraSignal ? combineAbortSignals([extraSignal, timeoutSignal]) : timeoutSignal;
-}
-
-function voicevoxStreamingSignal(extraSignal: AbortSignal): AbortSignal {
-  // ストリーミングは再生しながら受信するため、通常の合成より長めに待つ。
-  const timeoutSignal = AbortSignal.timeout(Math.max(voicevoxFetchTimeoutMs, 60_000));
-  return combineAbortSignals([extraSignal, timeoutSignal]);
 }
 
 async function initializeSpeaker(speaker: number): Promise<void> {
