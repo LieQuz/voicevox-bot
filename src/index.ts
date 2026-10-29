@@ -128,6 +128,7 @@ type VoicevoxSpeaker = {
 type QueueItem = {
   text: string;
   speaker: number;
+  preferBuffered?: boolean;
 };
 
 type SpeechAudio = {
@@ -293,19 +294,24 @@ client.on("messageCreate", async (message) => {
 
     const hasAttachments = message.attachments.size > 0;
     const hasStickers = message.stickers.size > 0;
-    const [text, speakerSetting] = await Promise.all([
+    const [normalized, speakerSetting] = await Promise.all([
       normalizeForSpeech(message.guild.id, message.content, message, hasAttachments, hasStickers),
       getUserSpeaker(message.guild.id, message.author.id)
     ]);
-    if (!text || guildStates.get(message.guild.id) !== state) {
+    if (!normalized.text || guildStates.get(message.guild.id) !== state) {
       return;
     }
 
-    await enqueueSpeech(
-      message.guild.id,
-      { text, speaker: speakerSetting ?? state.speaker },
-      { userId: message.author.id }
-    );
+    const speaker = speakerSetting ?? state.speaker;
+    const items: QueueItem[] = [
+      { text: normalized.text, speaker, preferBuffered: normalized.omitted }
+    ];
+    if (normalized.omitted) {
+      // 長文は「以下略」を別の発話として確実に再生する。
+      items.push({ text: speechOmissionSuffix, speaker, preferBuffered: true });
+    }
+
+    await enqueueSpeech(message.guild.id, items, { userId: message.author.id });
   } catch (error) {
     console.error("messageCreate handler error:", error);
   }
@@ -1004,7 +1010,7 @@ function clearSpeech(state: GuildState): void {
 async function prepareSpeechAudio(item: QueueItem, signal: AbortSignal): Promise<SpeechAudio> {
   const audioQuery = await fetchAudioQuery(item.text, item.speaker, signal);
 
-  if (streamingSynthesisAvailable) {
+  if (streamingSynthesisAvailable && !item.preferBuffered) {
     try {
       return await prepareStreamingSpeech(audioQuery, item.speaker, signal);
     } catch (error) {
@@ -1901,13 +1907,15 @@ async function notifyTextChannelThrottled(
 
 async function enqueueSpeech(
   guildId: string,
-  item: QueueItem,
+  itemOrItems: QueueItem | QueueItem[],
   options: { userId?: string; skipRateLimit?: boolean } = {}
 ): Promise<void> {
   const state = guildStates.get(guildId);
   if (!state) {
     return;
   }
+
+  const items = Array.isArray(itemOrItems) ? itemOrItems : [itemOrItems];
 
   if (!options.skipRateLimit && options.userId) {
     if (!isWithinRateLimit(guildId, options.userId)) {
@@ -1921,7 +1929,7 @@ async function enqueueSpeech(
     recordRateLimit(guildId, options.userId);
   }
 
-  if (state.queue.length >= maxQueueSize) {
+  if (state.queue.length + items.length > maxQueueSize) {
     await notifyTextChannelThrottled(
       guildId,
       state.textChannelId,
@@ -1930,7 +1938,7 @@ async function enqueueSpeech(
     return;
   }
 
-  state.queue.push(item);
+  state.queue.push(...items);
   // 再生中に届いたメッセージは、現在の再生が終わる前に合成を開始しておく。
   if (state.processing) {
     prepareNext(state);
@@ -2096,24 +2104,31 @@ const speechOmissionSuffix = "以下略...";
 const speechOmissionSeparator = "、";
 const trailingPausePattern = /[。、，．！？!?…,.]$/;
 
-function truncateForSpeech(text: string): string {
+function splitForSpeech(text: string): { text: string; omitted: boolean } {
   const characters = Array.from(text);
   if (characters.length <= speechTextLimit) {
-    return text;
+    return { text, omitted: false };
   }
 
   const suffixLength = Array.from(speechOmissionSuffix).length;
-  const reservedLength = suffixLength + 1;
-  const visibleLength = Math.max(0, speechTextLimit - reservedLength);
+  const visibleLength = Math.max(0, speechTextLimit - suffixLength);
   const truncated = characters.slice(0, visibleLength).join("").trimEnd();
-  const separator = trailingPausePattern.test(truncated) ? "" : speechOmissionSeparator;
-  const result = `${truncated}${separator}${speechOmissionSuffix}`;
   if (ttsDebug) {
     console.log(
-      `[TTS] truncated ${characters.length} -> ${Array.from(result).length} chars: ...${result.slice(-20)}`
+      `[TTS] truncated ${characters.length} -> ${Array.from(truncated).length} chars (+ separate suffix)`
     );
   }
-  return result;
+  return { text: truncated, omitted: true };
+}
+
+function truncateForSpeech(text: string): string {
+  const result = splitForSpeech(text);
+  if (!result.omitted) {
+    return result.text;
+  }
+
+  const separator = trailingPausePattern.test(result.text) ? "" : speechOmissionSeparator;
+  return `${result.text}${separator}${speechOmissionSuffix}`;
 }
 
 async function normalizeDisplayNameForSpeech(guildId: string, displayName: string): Promise<string> {
@@ -2127,18 +2142,18 @@ async function normalizeForSpeech(
   message: SpeechMessageContext,
   hasAttachments: boolean,
   hasStickers: boolean
-): Promise<string> {
+): Promise<{ text: string; omitted: boolean }> {
   const trimmed = content.trim();
   if (!trimmed && !hasAttachments && !hasStickers) {
-    return "";
+    return { text: "", omitted: false };
   }
 
   if (!trimmed && hasStickers) {
-    return "スタンプが投稿されました";
+    return { text: "スタンプが投稿されました", omitted: false };
   }
 
   if (/^```[\s\S]*```$/.test(trimmed)) {
-    return "コードブロックが投稿されました";
+    return { text: "コードブロックが投稿されました", omitted: false };
   }
 
   let working = trimmed.replace(/```[\s\S]*?```/g, " コードブロック ");
@@ -2169,7 +2184,7 @@ async function normalizeForSpeech(
 
   const withoutUrls = withMediaNotice.replace(/https?:\/\/\S+/g, "URL");
   const normalizedSpaces = await applyEmojiAndDictionaryTransform(guildId, withoutUrls);
-  return truncateForSpeech(normalizedSpaces);
+  return splitForSpeech(normalizedSpaces);
 }
 
 function isJoinableVoiceChannel(channel: GuildBasedChannel): channel is VoiceBasedChannel {
