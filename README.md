@@ -128,7 +128,7 @@ VOICEVOX_PAUSE_LENGTH_SCALE=0.95
 - `VOICEVOX_PAUSE_LENGTH_SCALE`: `0.9〜1.0` で読点の間を調整
 - `/speaker` で話者・スタイルを変えるだけでも印象が大きく変わります
 
-ナレーション向けの別音声 **VOICEVOX NEMO** を試す方法は [DOKPLOY.md](DOKPLOY.md#より自然な声を試すvoicevox-nemo) を参照してください。
+ナレーション向けの別音声 **VOICEVOX NEMO** を試す方法は [DOKPLOY.md](DOKPLOY.md#6-より自然な声を試すvoicevox-nemo) を参照してください。
 
 `/speaker` のプルダウン選択は「実行したユーザー自身」の設定を保存します。  
 保存先DB: `data/voicevox-bot.sqlite3`
