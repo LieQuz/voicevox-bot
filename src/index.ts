@@ -35,7 +35,7 @@ import {
 import nodeEmoji = require("node-emoji");
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { Readable, Transform } from "node:stream";
+import { PassThrough, Readable, Transform } from "node:stream";
 import { replaceUnicodeEmojiWithJapanese, replaceUnknownEmojiWithFallback } from "./emoji-japanese";
 
 const token = process.env.DISCORD_TOKEN;
@@ -51,6 +51,8 @@ const voicevoxFetchTimeoutMs = Number.parseInt(process.env.VOICEVOX_FETCH_TIMEOU
 const voicevoxPrewarmLimit = Number.parseInt(process.env.VOICEVOX_PREWARM_LIMIT ?? "4", 10);
 const voicevoxStreamingIdleTimeoutMs = Math.max(voicevoxFetchTimeoutMs, 120_000);
 const speechSilencePaddingFrames = 10;
+// VOICEVOXのストリームを再生速度で読むとkeep-aliveで切られるため、先にこのサイズまで吸い出す。
+const streamBufferHighWaterMark = 8 * 1024 * 1024;
 const maxQueueSize = Number.parseInt(process.env.MAX_QUEUE_SIZE ?? "50", 10);
 const rateLimitMaxMessages = Number.parseInt(process.env.RATE_LIMIT_MAX ?? "5", 10);
 const rateLimitWindowMs = Number.parseInt(process.env.RATE_LIMIT_WINDOW_MS ?? "10000", 10);
@@ -128,7 +130,6 @@ type VoicevoxSpeaker = {
 type QueueItem = {
   text: string;
   speaker: number;
-  preferBuffered?: boolean;
 };
 
 type SpeechAudio = {
@@ -303,12 +304,10 @@ client.on("messageCreate", async (message) => {
     }
 
     const speaker = speakerSetting ?? state.speaker;
-    const items: QueueItem[] = [
-      { text: normalized.text, speaker, preferBuffered: normalized.omitted }
-    ];
+    const items: QueueItem[] = [{ text: normalized.text, speaker }];
     if (normalized.omitted) {
       // 長文は「以下略」を別の発話として確実に再生する。
-      items.push({ text: speechOmissionSuffix, speaker, preferBuffered: true });
+      items.push({ text: speechOmissionSuffix, speaker });
     }
 
     await enqueueSpeech(message.guild.id, items, { userId: message.author.id });
@@ -1010,7 +1009,7 @@ function clearSpeech(state: GuildState): void {
 async function prepareSpeechAudio(item: QueueItem, signal: AbortSignal): Promise<SpeechAudio> {
   const audioQuery = await fetchAudioQuery(item.text, item.speaker, signal);
 
-  if (streamingSynthesisAvailable && !item.preferBuffered) {
+  if (streamingSynthesisAvailable) {
     try {
       return await prepareStreamingSpeech(audioQuery, item.speaker, signal);
     } catch (error) {
@@ -1195,12 +1194,21 @@ async function prepareStreamingSpeech(
     }
   });
 
+  const bufferedStream = new PassThrough({ highWaterMark: streamBufferHighWaterMark });
+
   pcmStream.once("error", () => {
     clearIdleTimer();
     if (!disposed && !idleTimedOut) {
       console.error("VOICEVOX streaming_synthesis stream failed.");
     }
     markSynthesized();
+    // 転送が終端で少し切れた場合でも、受信済みの音声は再生する。
+    // 「以下略」は別キューなので、ここで失われても後続で再生される。
+    if (disposed) {
+      bufferedStream.destroy();
+    } else if (!bufferedStream.destroyed) {
+      bufferedStream.end();
+    }
   });
   pcmStream.once("close", () => {
     clearIdleTimer();
@@ -1212,9 +1220,10 @@ async function prepareStreamingSpeech(
     pcmStream.destroy(error);
   });
   bodyStream.pipe(pcmStream);
+  pcmStream.pipe(bufferedStream);
 
   return {
-    resource: createAudioResource(pcmStream, {
+    resource: createAudioResource(bufferedStream, {
       inputType: StreamType.Raw,
       silencePaddingFrames: speechSilencePaddingFrames
     }),
@@ -1228,6 +1237,7 @@ async function prepareStreamingSpeech(
       abortController.abort();
       bodyStream.destroy();
       pcmStream.destroy();
+      bufferedStream.destroy();
     }
   };
 }
