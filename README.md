@@ -22,6 +22,10 @@
 - 文頭が `@` の場合は `アット` と読ませる
 - 画像/動画など添付付き投稿は `メディアが投稿されました` を読み上げ
 - 読み上げ対象チャンネルで `s` と送信すると、現在の読み上げを停止し、溜まっている読み上げキューも全てキャンセル
+- VOICEVOX のストリーミング合成で、合成完了を待たずに発話を開始（低遅延）
+- 48kHz ステレオ PCM を直接再生し、ffmpeg・一時ファイルを経由しない
+- 起動時と話者変更時に VOICEVOX の話者モデルを事前ロード
+- 次の発話を先読み合成し、連続メッセージの間隔を短縮
 - 絵文字は CLDR 由来の日本語名へ変換（`src/data/emoji-ja-names.json`、未登録は「絵文字」）
 - サーバーカスタム絵文字（`:name:` 形式）は「カスタム絵文字」と読み上げ
 - `w` / `ｗ` は読み上げ時に正規化（単体は `わら`、2文字以上は `わらわら`）
@@ -92,10 +96,15 @@ DEFAULT_SPEAKER=1
 DEFAULT_SPEED_SCALE=1.2
 SPEAKER_CACHE_TTL_MS=300000
 VOICEVOX_FETCH_TIMEOUT_MS=10000
+VOICEVOX_STREAMING_SYNTHESIS=true
 MAX_QUEUE_SIZE=50
 RATE_LIMIT_MAX=5
 RATE_LIMIT_WINDOW_MS=10000
 ```
+
+`VOICEVOX_STREAMING_SYNTHESIS=false` にすると、従来の一括合成（`/synthesis`）に戻せます。
+
+ストリーミング再生が利用できない古い VOICEVOX Engine では自動で一括合成にフォールバックします。
 
 `/speaker` のプルダウン選択は「実行したユーザー自身」の設定を保存します。  
 保存先DB: `data/voicevox-bot.sqlite3`

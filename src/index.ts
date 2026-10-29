@@ -4,6 +4,7 @@ import sqlite3 from "sqlite3";
 import {
   AudioPlayer,
   AudioPlayerStatus,
+  AudioResource,
   VoiceConnection,
   VoiceConnectionStatus,
   createAudioPlayer,
@@ -34,7 +35,7 @@ import {
 import nodeEmoji = require("node-emoji");
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { replaceUnicodeEmojiWithJapanese, replaceUnknownEmojiWithFallback } from "./emoji-japanese";
 
 const token = process.env.DISCORD_TOKEN;
@@ -47,6 +48,9 @@ const voicevoxFetchTimeoutMs = Number.parseInt(process.env.VOICEVOX_FETCH_TIMEOU
 const maxQueueSize = Number.parseInt(process.env.MAX_QUEUE_SIZE ?? "50", 10);
 const rateLimitMaxMessages = Number.parseInt(process.env.RATE_LIMIT_MAX ?? "5", 10);
 const rateLimitWindowMs = Number.parseInt(process.env.RATE_LIMIT_WINDOW_MS ?? "10000", 10);
+const streamingSynthesisEnabled = !["false", "0", "no", "off"].includes(
+  (process.env.VOICEVOX_STREAMING_SYNTHESIS ?? "true").trim().toLowerCase()
+);
 
 if (!token) {
   throw new Error("DISCORD_TOKEN is not set.");
@@ -82,6 +86,8 @@ if (Number.isNaN(rateLimitWindowMs) || rateLimitWindowMs <= 0) {
 
 type VoicevoxAudioQuery = {
   speedScale: number;
+  outputSamplingRate: number;
+  outputStereo: boolean;
   [key: string]: unknown;
 };
 
@@ -98,6 +104,19 @@ type QueueItem = {
   speaker: number;
 };
 
+type SpeechAudio = {
+  resource: AudioResource;
+  synthesized: Promise<void>;
+  dispose: () => void;
+};
+
+type PreparedSpeech = {
+  item: QueueItem;
+  promise: Promise<SpeechAudio>;
+  abort: AbortController;
+  dispose: () => void;
+};
+
 type SpeakerSelectOption = {
   value: string;
   label: string;
@@ -110,6 +129,7 @@ type PronunciationRule = {
 };
 
 type GuildState = {
+  guildId: string;
   connection: VoiceConnection;
   player: AudioPlayer;
   queue: QueueItem[];
@@ -117,10 +137,16 @@ type GuildState = {
   speaker: number;
   textChannelId?: string;
   voiceChannelId: string;
+  prepared?: PreparedSpeech;
+  activeAudio?: SpeechAudio;
+  idleWaiters?: Array<() => void>;
 };
 
 const guildStates = new Map<string, GuildState>();
 const autoJoinInFlight = new Map<string, Promise<void>>();
+const userSpeakerCache = new Map<string, number | null>();
+const initializedSpeakers = new Set<number>();
+let streamingSynthesisAvailable = streamingSynthesisEnabled;
 let db: Database;
 let cachedSpeakers: VoicevoxSpeaker[] | null = null;
 let speakersCachedAt = 0;
@@ -234,21 +260,25 @@ client.on("messageCreate", async (message) => {
     }
 
     if (message.content.trim().toLowerCase() === "s") {
-      state.queue.length = 0;
-      state.player.stop(true);
+      clearSpeech(state);
       return;
     }
 
     const hasAttachments = message.attachments.size > 0;
     const hasStickers = message.stickers.size > 0;
-    const text = await normalizeForSpeech(message.guild.id, message.content, message, hasAttachments, hasStickers);
-    if (!text) {
+    const [text, speakerSetting] = await Promise.all([
+      normalizeForSpeech(message.guild.id, message.content, message, hasAttachments, hasStickers),
+      getUserSpeaker(message.guild.id, message.author.id)
+    ]);
+    if (!text || guildStates.get(message.guild.id) !== state) {
       return;
     }
 
-    const speaker = (await getUserSpeaker(message.guild.id, message.author.id)) ?? state.speaker;
-
-    await enqueueSpeech(message.guild.id, { text, speaker }, { userId: message.author.id });
+    await enqueueSpeech(
+      message.guild.id,
+      { text, speaker: speakerSetting ?? state.speaker },
+      { userId: message.author.id }
+    );
   } catch (error) {
     console.error("messageCreate handler error:", error);
   }
@@ -274,6 +304,9 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     await setUserSpeaker(interaction.guild.id, interaction.user.id, speaker);
+    void initializeSpeaker(speaker).catch((error) => {
+      console.warn(`Failed to pre-warm VOICEVOX speaker ${speaker}:`, error);
+    });
     await interaction.update({
       content: `あなたの話者IDを ${speaker} に保存しました。`,
       components: []
@@ -341,6 +374,9 @@ client.on("interactionCreate", async (interaction) => {
     if (state) {
       state.speaker = speaker;
     }
+    void initializeSpeaker(speaker).catch((error) => {
+      console.warn(`Failed to pre-warm VOICEVOX speaker ${speaker}:`, error);
+    });
     await replyPrivate(interaction, `サーバーの標準話者IDを ${speaker} に設定しました。`);
     return;
   }
@@ -592,6 +628,8 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
 
   const humanMemberCount = [...voiceChannel.members.values()].filter((member) => !member.user.bot).length;
   if (humanMemberCount === 0) {
+    // 退出アナウンスを最後まで再生してから切断する。
+    await waitForQueueIdle(state, 30_000);
     await disconnectGuild(guildId);
   }
   } catch (error) {
@@ -644,6 +682,7 @@ async function joinCommand(interaction: ChatInputCommandInteraction): Promise<vo
 
   const guildSpeaker = await getGuildDefaultSpeaker(interaction.guild!.id);
   guildStates.set(interaction.guild!.id, {
+    guildId: interaction.guild!.id,
     connection,
     player,
     queue: [],
@@ -651,6 +690,10 @@ async function joinCommand(interaction: ChatInputCommandInteraction): Promise<vo
     speaker: guildSpeaker,
     textChannelId: interaction.channelId,
     voiceChannelId: voiceChannel.id
+  });
+
+  void initializeSpeaker(guildSpeaker).catch((error) => {
+    console.warn(`Failed to pre-warm VOICEVOX speaker ${guildSpeaker}:`, error);
   });
 
   await replyPrivate(interaction, "VCへ参加しました。このチャンネルのメッセージを読み上げます。");
@@ -692,6 +735,7 @@ async function autoJoinVoiceChannel(
   connection.subscribe(player);
   const guildSpeaker = await getGuildDefaultSpeaker(guildId);
   guildStates.set(guildId, {
+    guildId,
     connection,
     player,
     queue: [],
@@ -699,6 +743,10 @@ async function autoJoinVoiceChannel(
     speaker: guildSpeaker,
     textChannelId,
     voiceChannelId: voiceChannel.id
+  });
+
+  void initializeSpeaker(guildSpeaker).catch((error) => {
+    console.warn(`Failed to pre-warm VOICEVOX speaker ${guildSpeaker}:`, error);
   });
 }
 
@@ -718,79 +766,546 @@ async function processQueue(guildId: string): Promise<void> {
     return;
   }
 
-  const next = state.queue.shift();
+  state.processing = true;
+
+  try {
+    while (true) {
+      if (guildStates.get(guildId) !== state) {
+        break;
+      }
+
+      const next = state.queue[0];
+      if (!next) {
+        break;
+      }
+
+      if (state.prepared && state.prepared.item !== next) {
+        state.prepared.dispose();
+        state.prepared = undefined;
+      }
+
+      if (!state.prepared) {
+        beginPreparation(state, next);
+      }
+
+      const prepared = state.prepared!;
+      let audio: SpeechAudio;
+      try {
+        audio = await prepared.promise;
+      } catch (error) {
+        if (state.prepared === prepared) {
+          state.prepared = undefined;
+        }
+        if (state.queue[0] === next) {
+          state.queue.shift();
+        }
+        if (!prepared.abort.signal.aborted) {
+          console.error(`Failed to synthesize queue item in guild ${guildId}:`, error);
+        }
+        continue;
+      }
+
+      if (state.prepared === prepared) {
+        state.prepared = undefined;
+      }
+
+      if (guildStates.get(guildId) !== state || state.queue[0] !== next) {
+        audio.dispose();
+        continue;
+      }
+
+      state.queue.shift();
+      state.activeAudio = audio;
+
+      try {
+        await playSpeech(state, audio);
+      } catch (error) {
+        console.error(`Failed to play queue item in guild ${guildId}:`, error);
+      } finally {
+        if (state.activeAudio === audio) {
+          state.activeAudio = undefined;
+        }
+        audio.dispose();
+      }
+    }
+  } finally {
+    state.processing = false;
+  }
+
+  if (guildStates.get(guildId) === state && state.queue.length > 0) {
+    void processQueue(guildId);
+  } else if (state.queue.length === 0) {
+    notifyQueueIdle(state);
+  }
+}
+
+function notifyQueueIdle(state: GuildState): void {
+  if (state.processing || state.queue.length > 0) {
+    return;
+  }
+
+  resolveQueueIdleWaiters(state);
+}
+
+function resolveQueueIdleWaiters(state: GuildState): void {
+  const waiters = state.idleWaiters;
+  if (!waiters || waiters.length === 0) {
+    return;
+  }
+
+  state.idleWaiters = [];
+  for (const resolve of waiters) {
+    resolve();
+  }
+}
+
+function waitForQueueIdle(state: GuildState, timeoutMs: number): Promise<void> {
+  if (!state.processing && state.queue.length === 0) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer: NodeJS.Timeout;
+
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+
+    timer = setTimeout(finish, timeoutMs);
+    (state.idleWaiters ??= []).push(finish);
+  });
+}
+
+function beginPreparation(state: GuildState, item: QueueItem): PreparedSpeech {
+  const abort = new AbortController();
+  let audio: SpeechAudio | undefined;
+  let cancelled = false;
+
+  const promise = prepareSpeechAudio(item, abort.signal).then((preparedAudio) => {
+    audio = preparedAudio;
+    if (cancelled) {
+      preparedAudio.dispose();
+    }
+    return preparedAudio;
+  });
+  promise.catch(() => {
+    // Rejections are handled by processQueue when this item is consumed.
+  });
+
+  const prepared: PreparedSpeech = {
+    item,
+    promise,
+    abort,
+    dispose: () => {
+      cancelled = true;
+      abort.abort();
+      audio?.dispose();
+    }
+  };
+
+  state.prepared = prepared;
+  return prepared;
+}
+
+function prepareNext(state: GuildState): void {
+  if (!state.processing || state.prepared) {
+    return;
+  }
+
+  const next = state.queue[0];
   if (!next) {
     return;
   }
 
-  state.processing = true;
+  beginPreparation(state, next);
+}
 
-  try {
-    const wav = await synthesizeVoice(next.text, next.speaker);
-    const resource = createAudioResource(Readable.from(wav), { inputType: StreamType.Arbitrary });
-    state.player.play(resource);
-    await entersState(state.player, AudioPlayerStatus.Playing, 10_000);
+function playSpeech(state: GuildState, audio: SpeechAudio): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      state.player.off(AudioPlayerStatus.Idle, onIdle);
+      state.player.off("error", onError);
+    };
+    const onIdle = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
 
-    await new Promise<void>((resolve, reject) => {
-      const onIdle = () => {
-        state.player.off("error", onError);
-        resolve();
-      };
-      const onError = (error: Error) => {
-        state.player.off(AudioPlayerStatus.Idle, onIdle);
-        reject(error);
-      };
+    state.player.once(AudioPlayerStatus.Idle, onIdle);
+    state.player.once("error", onError);
 
-      state.player.once(AudioPlayerStatus.Idle, onIdle);
-      state.player.once("error", onError);
+    try {
+      state.player.play(audio.resource);
+    } catch (error) {
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
+
+    // 次の発話は、現在の音声合成が終わり次第すぐに先読みを開始する。
+    void audio.synthesized.then(() => {
+      if (state.activeAudio === audio && guildStates.get(state.guildId) === state) {
+        prepareNext(state);
+      }
     });
-  } catch (error) {
-    console.error("Failed to process queue item:", error);
-  } finally {
-    state.processing = false;
-    if (guildStates.has(guildId)) {
-      await processQueue(guildId);
+  });
+}
+
+function clearSpeech(state: GuildState): void {
+  state.queue.length = 0;
+  if (state.prepared) {
+    state.prepared.dispose();
+    state.prepared = undefined;
+  }
+
+  const activeAudio = state.activeAudio;
+  state.activeAudio = undefined;
+  state.player.stop(true);
+  activeAudio?.dispose();
+}
+
+async function prepareSpeechAudio(item: QueueItem, signal: AbortSignal): Promise<SpeechAudio> {
+  const audioQuery = await fetchAudioQuery(item.text, item.speaker, signal);
+
+  if (streamingSynthesisAvailable) {
+    try {
+      return await prepareStreamingSpeech(audioQuery, item.speaker, signal);
+    } catch (error) {
+      if (signal.aborted) {
+        throw error;
+      }
+      if (!(error instanceof StreamingSynthesisUnsupportedError)) {
+        throw error;
+      }
+
+      streamingSynthesisAvailable = false;
+      console.warn(
+        "VOICEVOX streaming synthesis is not available. Falling back to /synthesis.",
+        error
+      );
     }
   }
+
+  return prepareBufferedSpeech(audioQuery, item.speaker, signal);
 }
 
-function voicevoxFetchSignal(): AbortSignal {
-  return AbortSignal.timeout(voicevoxFetchTimeoutMs);
-}
-
-async function synthesizeVoice(text: string, speaker: number): Promise<Buffer> {
+async function fetchAudioQuery(
+  text: string,
+  speaker: number,
+  signal: AbortSignal
+): Promise<VoicevoxAudioQuery> {
   const params = new URLSearchParams({
     text,
     speaker: String(speaker)
   });
 
-  const queryResponse = await fetch(`${voicevoxBaseUrl}/audio_query?${params.toString()}`, {
+  const response = await fetch(`${voicevoxBaseUrl}/audio_query?${params.toString()}`, {
     method: "POST",
-    signal: voicevoxFetchSignal()
+    signal: voicevoxFetchSignal(signal)
   });
 
-  if (!queryResponse.ok) {
-    throw new Error(`VOICEVOX audio_query failed: ${queryResponse.status} ${queryResponse.statusText}`);
+  if (!response.ok) {
+    throw new Error(`VOICEVOX audio_query failed: ${response.status} ${response.statusText}`);
   }
 
-  const audioQuery = (await queryResponse.json()) as VoicevoxAudioQuery;
+  const audioQuery = (await response.json()) as VoicevoxAudioQuery;
   audioQuery.speedScale = defaultSpeedScale;
+  // 48kHz stereo PCM は ffmpeg を介さず直接 @discordjs/voice に渡せる。
+  audioQuery.outputSamplingRate = 48_000;
+  audioQuery.outputStereo = true;
+  return audioQuery;
+}
 
-  const synthesisResponse = await fetch(`${voicevoxBaseUrl}/synthesis?speaker=${speaker}`, {
+class StreamingSynthesisUnsupportedError extends Error {}
+
+const wavHeaderSize = 44;
+
+async function prepareStreamingSpeech(
+  audioQuery: VoicevoxAudioQuery,
+  speaker: number,
+  signal: AbortSignal
+): Promise<SpeechAudio> {
+  const response = await fetch(`${voicevoxBaseUrl}/streaming_synthesis?speaker=${speaker}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
     },
     body: JSON.stringify(audioQuery),
-    signal: voicevoxFetchSignal()
+    signal: voicevoxStreamingSignal(signal)
   });
 
-  if (!synthesisResponse.ok) {
-    throw new Error(`VOICEVOX synthesis failed: ${synthesisResponse.status} ${synthesisResponse.statusText}`);
+  if (response.status === 404 || response.status === 405) {
+    throw new StreamingSynthesisUnsupportedError(
+      `VOICEVOX streaming_synthesis returned ${response.status} ${response.statusText}`
+    );
   }
 
-  const audioBuffer = await synthesisResponse.arrayBuffer();
-  return Buffer.from(audioBuffer);
+  if (!response.ok) {
+    throw new Error(`VOICEVOX streaming_synthesis failed: ${response.status} ${response.statusText}`);
+  }
+
+  if (!response.body) {
+    throw new Error("VOICEVOX streaming_synthesis returned an empty response body.");
+  }
+
+  const bodyStream = Readable.fromWeb(
+    response.body as unknown as import("node:stream/web").ReadableStream
+  );
+  let disposed = false;
+  let headerBuffer: Buffer = Buffer.alloc(0);
+  let headerParsed = false;
+  let markSynthesized = () => {};
+
+  const synthesized = new Promise<void>((resolve) => {
+    markSynthesized = resolve;
+  });
+
+  const pcmStream = new Transform({
+    transform(chunk, _encoding, callback) {
+      if (headerParsed) {
+        callback(null, chunk);
+        return;
+      }
+
+      const data: Buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+      headerBuffer = headerBuffer.length === 0 ? data : Buffer.concat([headerBuffer, data]);
+      if (headerBuffer.length < wavHeaderSize) {
+        callback();
+        return;
+      }
+
+      const header = headerBuffer.subarray(0, wavHeaderSize);
+      const audioFormat = header.readUInt16LE(20);
+      const channels = header.readUInt16LE(22);
+      const sampleRate = header.readUInt32LE(24);
+      const bitsPerSample = header.readUInt16LE(34);
+      if (
+        header.toString("ascii", 0, 4) !== "RIFF" ||
+        header.toString("ascii", 8, 12) !== "WAVE" ||
+        header.toString("ascii", 36, 40) !== "data" ||
+        audioFormat !== 1 ||
+        channels !== 2 ||
+        sampleRate !== 48_000 ||
+        bitsPerSample !== 16
+      ) {
+        callback(
+          new Error(
+            `VOICEVOX streaming_synthesis returned an unsupported WAV format (${sampleRate} Hz, ${channels} ch, ${bitsPerSample} bit).`
+          )
+        );
+        return;
+      }
+
+      headerParsed = true;
+      const remainingPcm = headerBuffer.subarray(wavHeaderSize);
+      headerBuffer = Buffer.alloc(0);
+      if (remainingPcm.length > 0) {
+        callback(null, remainingPcm);
+      } else {
+        callback();
+      }
+    },
+    flush(callback) {
+      markSynthesized();
+      callback();
+    }
+  });
+
+  pcmStream.once("error", () => {
+    if (!disposed) {
+      console.error("VOICEVOX streaming_synthesis stream failed.");
+    }
+    markSynthesized();
+  });
+  pcmStream.once("close", () => {
+    markSynthesized();
+  });
+
+  bodyStream.once("error", (error) => {
+    pcmStream.destroy(error);
+  });
+  bodyStream.pipe(pcmStream);
+
+  return {
+    resource: createAudioResource(pcmStream, { inputType: StreamType.Raw }),
+    synthesized,
+    dispose: () => {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      bodyStream.destroy();
+      pcmStream.destroy();
+    }
+  };
+}
+
+async function prepareBufferedSpeech(
+  audioQuery: VoicevoxAudioQuery,
+  speaker: number,
+  signal: AbortSignal
+): Promise<SpeechAudio> {
+  const response = await fetch(`${voicevoxBaseUrl}/synthesis?speaker=${speaker}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(audioQuery),
+    signal: voicevoxFetchSignal(signal)
+  });
+
+  if (!response.ok) {
+    throw new Error(`VOICEVOX synthesis failed: ${response.status} ${response.statusText}`);
+  }
+
+  const wav = Buffer.from(await response.arrayBuffer());
+  const pcm = parseWavPcm(wav);
+  const isRawPcm = pcm !== undefined && pcm.sampleRate === 48_000 && pcm.channels === 2;
+  const stream = Readable.from([isRawPcm ? pcm.data : wav], { objectMode: false });
+  let disposed = false;
+
+  return {
+    resource: isRawPcm
+      ? createAudioResource(stream, { inputType: StreamType.Raw })
+      : createAudioResource(stream, { inputType: StreamType.Arbitrary }),
+    synthesized: Promise.resolve(),
+    dispose: () => {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      stream.destroy();
+    }
+  };
+}
+
+function parseWavPcm(
+  wav: Buffer
+): { data: Buffer; sampleRate: number; channels: number } | undefined {
+  if (wav.length < 12 || wav.toString("ascii", 0, 4) !== "RIFF" || wav.toString("ascii", 8, 12) !== "WAVE") {
+    return undefined;
+  }
+
+  let offset = 12;
+  let audioFormat = 0;
+  let channels = 0;
+  let sampleRate = 0;
+  let bitsPerSample = 0;
+
+  while (offset + 8 <= wav.length) {
+    const chunkId = wav.toString("ascii", offset, offset + 4);
+    const chunkSize = wav.readUInt32LE(offset + 4);
+    const dataStart = offset + 8;
+    const dataEnd = Math.min(dataStart + chunkSize, wav.length);
+
+    if (chunkId === "fmt " && dataStart + 16 <= wav.length) {
+      audioFormat = wav.readUInt16LE(dataStart);
+      channels = wav.readUInt16LE(dataStart + 2);
+      sampleRate = wav.readUInt32LE(dataStart + 4);
+      bitsPerSample = wav.readUInt16LE(dataStart + 14);
+    } else if (chunkId === "data") {
+      if (audioFormat !== 1 || bitsPerSample !== 16 || channels === 0 || sampleRate === 0) {
+        return undefined;
+      }
+      return { data: wav.subarray(dataStart, dataEnd), sampleRate, channels };
+    }
+
+    const nextOffset = dataStart + chunkSize + (chunkSize & 1);
+    if (nextOffset <= offset) {
+      return undefined;
+    }
+    offset = nextOffset;
+  }
+
+  return undefined;
+}
+
+function combineAbortSignals(signals: AbortSignal[]): AbortSignal {
+  const controller = new AbortController();
+  for (const signal of signals) {
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+      return controller.signal;
+    }
+    signal.addEventListener("abort", () => controller.abort(signal.reason), { once: true });
+  }
+  return controller.signal;
+}
+
+function voicevoxFetchSignal(extraSignal?: AbortSignal): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(voicevoxFetchTimeoutMs);
+  return extraSignal ? combineAbortSignals([extraSignal, timeoutSignal]) : timeoutSignal;
+}
+
+function voicevoxStreamingSignal(extraSignal: AbortSignal): AbortSignal {
+  // ストリーミングは再生しながら受信するため、通常の合成より長めに待つ。
+  const timeoutSignal = AbortSignal.timeout(Math.max(voicevoxFetchTimeoutMs, 60_000));
+  return combineAbortSignals([extraSignal, timeoutSignal]);
+}
+
+async function initializeSpeaker(speaker: number): Promise<void> {
+  if (initializedSpeakers.has(speaker)) {
+    return;
+  }
+
+  const params = new URLSearchParams({ speaker: String(speaker) });
+  const response = await fetch(`${voicevoxBaseUrl}/initialize_speaker?${params.toString()}`, {
+    method: "POST",
+    signal: AbortSignal.timeout(Math.max(voicevoxFetchTimeoutMs, 30_000))
+  });
+
+  if (!response.ok) {
+    throw new Error(`VOICEVOX initialize_speaker failed: ${response.status} ${response.statusText}`);
+  }
+
+  initializedSpeakers.add(speaker);
+}
+
+async function prewarmStoredSpeakers(): Promise<void> {
+  const speakers = new Set<number>([defaultSpeaker]);
+
+  try {
+    const userRows = await db.all<Array<{ speaker: number }>>(
+      "SELECT speaker FROM user_speakers GROUP BY speaker ORDER BY MAX(updated_at) DESC LIMIT 8;"
+    );
+    for (const row of userRows) {
+      speakers.add(row.speaker);
+    }
+
+    const guildRows = await db.all<Array<{ default_speaker: number }>>(
+      `
+        SELECT default_speaker
+        FROM guild_settings
+        WHERE default_speaker IS NOT NULL
+        GROUP BY default_speaker
+        ORDER BY MAX(updated_at) DESC
+        LIMIT 8;
+      `
+    );
+    for (const row of guildRows) {
+      speakers.add(row.default_speaker);
+    }
+  } catch (error) {
+    console.error("Failed to load stored speakers for pre-warming:", error);
+  }
+
+  for (const speaker of [...speakers].slice(0, 8)) {
+    try {
+      await initializeSpeaker(speaker);
+    } catch (error) {
+      console.warn(`Failed to pre-warm VOICEVOX speaker ${speaker}:`, error);
+    }
+  }
 }
 
 async function fetchVoicevoxSpeakers(): Promise<VoicevoxSpeaker[]> {
@@ -1161,9 +1676,16 @@ async function setUserSpeaker(guildId: string, userId: string, speaker: number):
     userId,
     speaker
   );
+  userSpeakerCache.set(`${guildId}:${userId}`, speaker);
 }
 
 async function getUserSpeaker(guildId: string, userId: string): Promise<number | undefined> {
+  const cacheKey = `${guildId}:${userId}`;
+  const cached = userSpeakerCache.get(cacheKey);
+  if (cached !== undefined) {
+    return cached ?? undefined;
+  }
+
   const row = await db.get<{ speaker: number }>(
     `
       SELECT speaker
@@ -1173,6 +1695,7 @@ async function getUserSpeaker(guildId: string, userId: string): Promise<number |
     guildId,
     userId
   );
+  userSpeakerCache.set(cacheKey, row?.speaker ?? null);
   return row?.speaker;
 }
 
@@ -1252,13 +1775,12 @@ async function disconnectGuildInternal(guildId: string, destroyConnection: boole
     return;
   }
 
-  state.queue.length = 0;
-  state.processing = false;
-  state.player.stop(true);
+  clearSpeech(state);
+  guildStates.delete(guildId);
+  resolveQueueIdleWaiters(state);
   if (destroyConnection && state.connection.state.status !== VoiceConnectionStatus.Destroyed) {
     state.connection.destroy();
   }
-  guildStates.delete(guildId);
 }
 
 function rateLimitKey(guildId: string, userId: string): string {
@@ -1329,7 +1851,11 @@ async function enqueueSpeech(
   }
 
   state.queue.push(item);
-  await processQueue(guildId);
+  // 再生中に届いたメッセージは、現在の再生が終わる前に合成を開始しておく。
+  if (state.processing) {
+    prepareNext(state);
+  }
+  void processQueue(guildId);
 }
 
 async function replyPrivate(interaction: ChatInputCommandInteraction, content: string): Promise<void> {
@@ -1570,6 +2096,7 @@ async function main(): Promise<void> {
   });
 
   await initDatabase();
+  void prewarmStoredSpeakers();
   await client.login(token);
 }
 
