@@ -2022,6 +2022,8 @@ async function applyEmojiAndDictionaryTransform(guildId: string, text: string): 
 
 const speechTextLimit = 80;
 const speechOmissionSuffix = "以下略...";
+const speechOmissionSeparator = "、";
+const trailingPausePattern = /[。、，．！？!?…,.]$/;
 
 function truncateForSpeech(text: string): string {
   const characters = Array.from(text);
@@ -2030,9 +2032,11 @@ function truncateForSpeech(text: string): string {
   }
 
   const suffixLength = Array.from(speechOmissionSuffix).length;
-  const visibleLength = Math.max(0, speechTextLimit - suffixLength);
+  const reservedLength = suffixLength + 1;
+  const visibleLength = Math.max(0, speechTextLimit - reservedLength);
   const truncated = characters.slice(0, visibleLength).join("").trimEnd();
-  return `${truncated}${speechOmissionSuffix}`;
+  const separator = trailingPausePattern.test(truncated) ? "" : speechOmissionSeparator;
+  return `${truncated}${separator}${speechOmissionSuffix}`;
 }
 
 async function normalizeDisplayNameForSpeech(guildId: string, displayName: string): Promise<string> {
