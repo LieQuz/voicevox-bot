@@ -2020,9 +2020,24 @@ async function applyEmojiAndDictionaryTransform(guildId: string, text: string): 
   return applyLaughNormalization(withFallbackEmoji).replace(/\s+/g, " ").trim();
 }
 
+const speechTextLimit = 80;
+const speechOmissionSuffix = "以下略...";
+
+function truncateForSpeech(text: string): string {
+  const characters = Array.from(text);
+  if (characters.length <= speechTextLimit) {
+    return text;
+  }
+
+  const suffixLength = Array.from(speechOmissionSuffix).length;
+  const visibleLength = Math.max(0, speechTextLimit - suffixLength);
+  const truncated = characters.slice(0, visibleLength).join("").trimEnd();
+  return `${truncated}${speechOmissionSuffix}`;
+}
+
 async function normalizeDisplayNameForSpeech(guildId: string, displayName: string): Promise<string> {
   const transformed = await applyEmojiAndDictionaryTransform(guildId, displayName.trim());
-  return transformed.slice(0, 120);
+  return truncateForSpeech(transformed);
 }
 
 async function normalizeForSpeech(
@@ -2073,7 +2088,7 @@ async function normalizeForSpeech(
 
   const withoutUrls = withMediaNotice.replace(/https?:\/\/\S+/g, "URL");
   const normalizedSpaces = await applyEmojiAndDictionaryTransform(guildId, withoutUrls);
-  return normalizedSpaces.slice(0, 120);
+  return truncateForSpeech(normalizedSpaces);
 }
 
 function isJoinableVoiceChannel(channel: GuildBasedChannel): channel is VoiceBasedChannel {
